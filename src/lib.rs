@@ -21,7 +21,6 @@ impl Worker {
             let message = receiver.lock().unwrap().recv().unwrap();
             match message {
                 WorkerMessage::NewJob(job) => {
-                    // println!("Worker {} got a job; executing.", id);
                     job();
                 }
                 WorkerMessage::Shutdown => {

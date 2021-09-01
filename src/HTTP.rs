@@ -233,16 +233,12 @@ pub enum FileAccessPolicy {
     RestrictUp,
 }
 
-
-// TODO: get rid of this type, since using this makes it so that every function 
-// can be running on just one thread at a time (which means the whole multithreaded
-// thing is useless)
-type ResponseGenerator = Arc<Mutex<Box<dyn Send + Sync + Fn(Request) -> Response>>>;
+type ResponseGenerator = Arc<Box<dyn Send + Sync + Fn(Request) -> Response>>;
 
 pub fn new_response_generator(
     f: Box<dyn Send + Sync + Fn(Request) -> Response>,
 ) -> ResponseGenerator {
-    Arc::new(Mutex::new(f))
+    Arc::new(f)
 }
 
 pub struct Server {
@@ -280,7 +276,7 @@ impl Server {
         // Bind 404 by default, can be overwritten:
         .with_route(
             "/404",
-            Arc::new(Mutex::new(Box::new(|_req| not_found_response()))),
+            Arc::new(Box::new(|_req| not_found_response())),
         )
     }
 
@@ -307,12 +303,11 @@ impl Server {
             match Server::http_request_from_tcp_stream(stream) {
                 Ok((request, stream)) => {
                     println!("[New Request] {}", request);
-                    let route_fn_ptr = match self.routes.get(&request.uri) {
+                    let route_fn = match self.routes.get(&request.uri) {
                         Some(func) => Arc::clone(func),
                         None => Arc::clone(self.routes.get("/404").unwrap()),
                     };
                     self.thread_pool.execute(move || {
-                        let route_fn = route_fn_ptr.lock().unwrap();
                         let http_response = route_fn(request);
                         Server::send_http_response_over_tcp(stream, http_response);
                     });
