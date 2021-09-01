@@ -5,7 +5,7 @@ use std::thread;
 
 pub mod HTTP;
 
-enum Message {
+enum WorkerMessage {
     NewJob(Job),
     Shutdown,
 }
@@ -16,15 +16,15 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>) -> Worker {
         let thread = thread::spawn(move || loop {
             let message = receiver.lock().unwrap().recv().unwrap();
             match message {
-                Message::NewJob(job) => {
+                WorkerMessage::NewJob(job) => {
                     // println!("Worker {} got a job; executing.", id);
                     job();
                 }
-                Message::Shutdown => {
+                WorkerMessage::Shutdown => {
                     println!(
                         "Worker {} received shutdown message, terminating thread.",
                         id
@@ -44,7 +44,8 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<WorkerMessage>,
+    receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
 }
 
 impl ThreadPool {
@@ -66,7 +67,27 @@ impl ThreadPool {
             workers.push(Worker::new(i + 1, Arc::clone(&receiver)));
         }
 
-        ThreadPool { workers, sender }
+        ThreadPool {
+            workers,
+            sender,
+            receiver,
+        }
+    }
+
+    pub fn set_thread_count(&mut self, new_thread_count: usize) {
+        let current_thread_count = self.workers.len();
+        if new_thread_count > current_thread_count {
+            for i in 0..(new_thread_count - current_thread_count) {
+                self.workers.push(Worker::new(
+                    i + 1 + current_thread_count,
+                    Arc::clone(&self.receiver),
+                ));
+            }
+        } else if new_thread_count < current_thread_count {
+            for _ in 0..(current_thread_count - new_thread_count) {
+                self.workers.pop();
+            }
+        }
     }
 
     /// Execute something with one of the threads in the thread pool.
@@ -79,7 +100,7 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        let message = Message::NewJob(Box::new(f));
+        let message = WorkerMessage::NewJob(Box::new(f));
         self.sender.send(message).unwrap();
     }
 }
@@ -89,7 +110,7 @@ impl Drop for ThreadPool {
         println!("Shutting down all workers.");
 
         for _ in &self.workers {
-            self.sender.send(Message::Shutdown).unwrap();
+            self.sender.send(WorkerMessage::Shutdown).unwrap();
         }
 
         for worker in &mut self.workers {

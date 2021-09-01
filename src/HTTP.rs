@@ -1,9 +1,20 @@
+
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::io::prelude::*;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 pub mod HTTPError;
 pub mod RequestMethods;
 pub mod StatusCodes;
+
+use crate::ThreadPool;
 
 #[derive(Eq, PartialEq)]
 pub enum RequestMethod {
@@ -215,4 +226,140 @@ impl fmt::Display for Response {
         let text = String::from_utf8_lossy(&bytes).to_string();
         write!(f, "{}", text)
     }
+}
+
+pub enum FileAccessPolicy {
+    AllowAll,
+    RestrictUp,
+}
+
+
+// TODO: get rid of this type, since using this makes it so that every function 
+// can be running on just one thread at a time (which means the whole multithreaded
+// thing is useless)
+type ResponseGenerator = Arc<Mutex<Box<dyn Send + Sync + Fn(Request) -> Response>>>;
+
+pub fn new_response_generator(
+    f: Box<dyn Send + Sync + Fn(Request) -> Response>,
+) -> ResponseGenerator {
+    Arc::new(Mutex::new(f))
+}
+
+pub struct Server {
+    pub thread_pool: ThreadPool,
+    // TODO: maybe this arc/mutex doesn't need to be there,
+    // since the adding of routes should only ever be
+    // done all at once in one thread.
+    pub routes: HashMap<String, ResponseGenerator>,
+    pub access_policy: FileAccessPolicy,
+    pub bind_addr: String,
+    listener: TcpListener,
+}
+
+fn not_found_response() -> Response {
+    Response::new()
+        .with_status(StatusCodes::NOT_FOUND)
+        .with_body(
+            b"<!DOCTYPE html>
+                        <html><body><h1>404 NOT FOUND</h1></body>
+                        </html>"
+                .to_vec(),
+        )
+        .prepare_response()
+}
+
+impl Server {
+    pub fn bind(addr: &str) -> Server {
+        Server {
+            thread_pool: ThreadPool::new(1),
+            routes: HashMap::new(),
+            access_policy: FileAccessPolicy::AllowAll,
+            bind_addr: addr.to_string(),
+            listener: TcpListener::bind(addr).unwrap(),
+        }
+        // Bind 404 by default, can be overwritten:
+        .with_route(
+            "/404",
+            Arc::new(Mutex::new(Box::new(|_req| not_found_response()))),
+        )
+    }
+
+    pub fn with_thread_count(mut self, count: usize) -> Server {
+        // Drop thread pool to make sure all
+        // threads finish their tasks.
+        self.thread_pool.set_thread_count(count);
+        self
+    }
+
+    pub fn with_route(mut self, route: &str, response: ResponseGenerator) -> Server {
+        self.routes.insert(route.to_string(), response);
+        self
+    }
+
+    pub fn with_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> Server {
+        self.routes = routes;
+        self
+    }
+
+    pub fn start(self) {
+        for stream in self.listener.incoming() {
+            let stream = stream.unwrap();
+            match Server::http_request_from_tcp_stream(stream) {
+                Ok((request, stream)) => {
+                    println!("[New Request] {}", request);
+                    let route_fn_ptr = match self.routes.get(&request.uri) {
+                        Some(func) => Arc::clone(func),
+                        None => Arc::clone(self.routes.get("/404").unwrap()),
+                    };
+                    self.thread_pool.execute(move || {
+                        let route_fn = route_fn_ptr.lock().unwrap();
+                        let http_response = route_fn(request);
+                        Server::send_http_response_over_tcp(stream, http_response);
+                    });
+                }
+                Err(e) => println!("[Request Error] {}", e),
+            }
+        }
+    }
+
+    fn http_request_from_tcp_stream(
+        mut stream: TcpStream,
+    ) -> Result<(Request, TcpStream), HTTPError::RequestParseError> {
+        let mut buffer = [0; 1024]; // 1kb buffer
+        let mut bytes_vec = Vec::new();
+        while let Ok(bytes_read) = stream.read(&mut buffer) {
+            for i in 0..bytes_read {
+                bytes_vec.push(buffer[i]);
+            }
+            if bytes_read < buffer.len() {
+                break;
+            }
+        };
+        match Request::from_bytes(&bytes_vec) {
+            Ok(request) => return Ok((request, stream)),
+            Err(e) => return Err(e),
+        }
+    }
+
+    fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
+        stream.write_all(&response.message_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+}
+
+pub fn file_response_generator(path: &str) -> ResponseGenerator {
+    let path_owned = path.to_string();
+    let func = move |_req| {
+        let bytes = fs::read(&path_owned);
+        match bytes {
+            Ok(bytes) => Response::new().with_body(bytes).prepare_response(),
+            // TODO: log an error here, the file_response_generator should
+            // never be initialized with a wrong path.
+            Err(e) => {
+                println!("Error opening path {}: {}", &path_owned, e);
+                not_found_response()
+            }
+        }
+    };
+    new_response_generator(Box::new(func))
 }
