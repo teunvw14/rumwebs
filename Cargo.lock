@@ -5,3 +5,17 @@ version = 3
 [[package]]
 name = "rumwebs"
 version = "0.1.0"
+dependencies = [
+ "rumwebs-http",
+]
+
+[[package]]
+name = "rumwebs-http"
+version = "0.1.0"
+dependencies = [
+ "rumwebs-threadpool",
+]
+
+[[package]]
+name = "rumwebs-threadpool"
+version = "0.1.0"

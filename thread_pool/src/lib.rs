@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
-pub mod HTTP;
-
 enum WorkerMessage {
     NewJob(Job),
     Shutdown,

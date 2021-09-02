@@ -1,5 +1,5 @@
 [package]
-name = "rumwebs"
+name = "rumwebs-http"
 version = "0.1.0"
 edition = "2018"
 
@@ -7,4 +7,4 @@ edition = "2018"
 
 [dependencies]
 
-rumwebs-http = { path = "./HTTP", version = "0.1.0" }
+rumwebs-threadpool = { path = "../thread_pool", version = "0.1.0" }
