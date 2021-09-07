@@ -493,7 +493,7 @@ pub mod HTTP {
         }
 
         fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
-            if let Err(e) stream.write_all(&response.message_bytes()) {
+            if let Err(e) = stream.write_all(&response.message_bytes()) {
                 println!("! Something went wrong sending a response.");
                 return;
             };
