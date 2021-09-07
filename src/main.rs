@@ -7,6 +7,7 @@ use std::time::Duration;
 
 fn say_hello(req: HTTP::Request) -> HTTP::Response {
     let name = match req.body {
+        // TODO: figure out why `body` is always Some instead of None.
         Some(body) => String::from_utf8_lossy(&body).to_string(),
         None => String::from("Anonymous User"),
     };
@@ -34,7 +35,7 @@ fn main() {
     println!("Starting server with {} threads...", thread_count);
     // Bind server to localhost:
     HTTP::Server::bind("127.0.0.1:7878")
-        .with_access_policy(HTTP::ServerAccessPolicy::RestrictUp)
+        // .with_access_policy(HTTP::ServerAccessPolicy::RestrictUp)
         .with_thread_count(thread_count)
         .with_route_to_file("/", "res/index.html")
         .with_route_to_file("/favicon", "res/favicon.png")

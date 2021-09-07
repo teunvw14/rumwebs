@@ -281,9 +281,17 @@ pub mod HTTP {
         }
     }
 
+    fn bad_request_response() -> Response {
+        let body = b"<!DOCTYPE html><html><body><h1>400 BAD REQUEST</h1></body></html>";
+        Response::new()
+            .with_status(StatusCodes::BAD_REQUEST)
+            .with_body(body)
+            .prepare_response()
+    }
+
     fn forbidden_response() -> Response {
         let body = b"<!DOCTYPE html><html><body><h1>403 FORBIDDEN</h1></body></html>";
-        Response::new() 
+        Response::new()
             .with_status(StatusCodes::FORBIDDEN)
             .with_body(body)
             .prepare_response()
@@ -322,7 +330,9 @@ pub mod HTTP {
                 listener: TcpListener::bind(addr).unwrap(),
                 running_path: PathBuf::new(),
             }
-            // Bind 403 and 404 by default, can be overwritten:
+            // Bind 400, 403 and 404 by default, as they are necessary for the
+            // server to function. They can be overwritten.
+            .with_route("/400", Box::new(|_req| bad_request_response()))
             .with_route("/403", Box::new(|_req| forbidden_response()))
             .with_route("/404",Box::new(|_req| not_found_response()),
             )
@@ -346,7 +356,10 @@ pub mod HTTP {
         }
 
         pub fn with_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> Server {
-            self.routes = routes;
+            // Add (so not replace) server routes.
+            for (route, response) in routes {
+                self.routes.insert(route, response);
+            };
             self
         }
 
@@ -360,25 +373,53 @@ pub mod HTTP {
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
             println!("Running path set to: {:?}", self.running_path);
+            self.panic_on_missing_mandatory_routes();
+            self.handle_connections();
+        }
+
+        fn panic_on_missing_mandatory_routes(&self) {
+            if !self.routes.contains_key("/400") {
+                panic!("Failed to start server. Missing route '/400', which is core to the functionality of the server.");
+            }
+            if !self.routes.contains_key("/403") {
+                panic!("Failed to start server. Missing route '/403', which is core to the functionality of the server.");
+            }
+            if !self.routes.contains_key("/404") {
+                panic!("Failed to start server. Missing route '/404', which is core to the functionality of the server.");
+            }
+        }
+
+        fn handle_connections(self) {
             for stream in self.listener.incoming() {
-                // TODO: remove this unwrap!!
-                let stream = stream.unwrap();
-                match Server::http_request_from_tcp_stream(stream) {
-                    Ok((request, stream)) => {
+                // If something went wrong dealing with the stream, we don't
+                // want to send back data, so we continue the loop to the next
+                // incoming connection.
+                if let Err(_) = stream {
+                    continue;
+                }
+                let mut stream = stream.unwrap();
+                let unknown_route_handler;
+                let response_generator;
+                let mut request = Request::new();
+                match Server::http_request_from_tcp_stream(&mut stream) {
+                    Ok(req) => {
+                        request = req;
                         println!("[New Request] {}", request);
-                        let unknown_route_handler = self.get_unknown_route_handler(&request.uri);
-                        let response_generator = match self.routes.get(&request.uri) {
+                        unknown_route_handler = self.get_unknown_route_handler(&request.uri);
+                        response_generator = match self.routes.get(&request.uri) {
                             Some(route_response) => route_response,
                             None => &unknown_route_handler,
                         };
-                        let route_fn = Arc::clone(&response_generator.0);
-                        self.thread_pool.execute(move || {
-                            let http_response = route_fn(request);
-                            Server::send_http_response_over_tcp(stream, http_response);
-                        });
                     }
-                    Err(e) => println!("[Request Error] {}", e),
+                    Err(_) => {
+                        response_generator = self.routes.get("/400").unwrap();
+                    },
                 }
+                let response_fn = Arc::clone(&response_generator.0);
+                self.thread_pool.execute(move || {
+                    let http_response = response_fn(request);
+                    Server::send_http_response_over_tcp(stream, http_response);
+                })
             }
         }
 
@@ -432,8 +473,8 @@ pub mod HTTP {
         }
 
         fn http_request_from_tcp_stream(
-            mut stream: TcpStream,
-        ) -> Result<(Request, TcpStream), HTTPError::InvalidRequest> {
+            stream: &mut TcpStream,
+        ) -> Result<Request, HTTPError::InvalidRequest> {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
             while let Ok(bytes_read) = stream.read(&mut buffer) {
@@ -445,7 +486,7 @@ pub mod HTTP {
                 }
             };
             match Request::from_bytes(&bytes_vec) {
-                Ok(request) => return Ok((request, stream)),
+                Ok(request) => return Ok(request),
                 Err(e) => return Err(e),
             }
         }

@@ -16,6 +16,11 @@ pub const OK: StatusCode = StatusCode {
     name: "OK",
 };
 
+pub const BAD_REQUEST: StatusCode = StatusCode {
+    code: 400,
+    name: "Bad Request",
+};
+
 pub const UNAUTHORIZED: StatusCode = StatusCode {
     code: 401,
     name: "Unauthorized",
