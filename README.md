@@ -1,6 +1,8 @@
 # rumwebs | a **Ru**st **M**ultithreaded **Web** **S**erver
 
-It doesn't have any dependencies at the moment! There will be some added though. 
+It works :D
+
+Note: I can't guarantee the safety of this piece of software.
 
 # Building
 
