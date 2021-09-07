@@ -1,21 +1,23 @@
-
-pub mod HTTPError;
-pub mod RequestMethods;
-pub mod StatusCodes;
-
 extern crate rumwebs_threadpool;
-
 pub mod HTTP {
+    pub mod HTTPError;
+    pub mod RequestMethods;
+    pub mod StatusCodes;
+
     use std::collections::HashMap;
     use std::net::TcpListener;
     use std::net::TcpStream;
     use std::io::prelude::*;
+    use std::path::{Path, PathBuf};
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::fmt;
+    use std::env;
     use std::fs;
+    
+    use lazy_static::lazy_static;
+    use regex::Regex;
 
-    use crate::HTTPError;
-    use crate::StatusCodes;
     use rumwebs_threadpool::ThreadPool;
 
     #[derive(Eq, PartialEq)]
@@ -29,6 +31,28 @@ pub mod HTTP {
         OPTIONS,
         TRACE,
         PATCH,
+    }
+
+    impl RequestMethod {
+        pub fn from_str(s: &str) -> Result<RequestMethod, HTTPError::InvalidRequestMethod> {
+            match s {
+                "GET" => Ok(RequestMethod::GET),
+                "HEAD" => Ok(RequestMethod::HEAD),
+                "POST" => Ok(RequestMethod::POST),
+                "PUT" => Ok(RequestMethod::PUT),
+                "DELETE" => Ok(RequestMethod::DELETE),
+                "CONNECT" => Ok(RequestMethod::CONNECT),
+                "OPTIONS" => Ok(RequestMethod::OPTIONS),
+                "TRACE" => Ok(RequestMethod::TRACE),
+                "PATCH" => Ok(RequestMethod::PATCH),
+                // This should never happen, since the 
+                _ => {
+                    return Err(HTTPError::InvalidRequestMethod::new(
+                        "String doesn't make a valid HTTP request method.",
+                    ))
+                }
+            }
+        }
     }
 
     impl fmt::Display for RequestMethod {
@@ -67,10 +91,10 @@ pub mod HTTP {
             }
         }
 
-        pub fn from_bytes(bytes: &[u8]) -> Result<Request, HTTPError::RequestParseError> {
+        pub fn from_bytes(bytes: &[u8]) -> Result<Request, HTTPError::InvalidRequest> {
             // Check if the bytes even form an HTTP request.
             if !String::from_utf8_lossy(bytes).contains("HTTP/") {
-                return Err(HTTPError::RequestParseError::new(
+                return Err(HTTPError::InvalidRequest::new(
                     "Bytes don't form a valid HTTP request.",
                 ));
             }
@@ -93,51 +117,50 @@ pub mod HTTP {
                 head = bytes.to_vec();
                 body = None;
             };
+
             let head_str = match String::from_utf8(head) {
                 Ok(h) => h,
                 Err(_) => {
-                    return Err(HTTPError::RequestParseError::new(
+                    return Err(HTTPError::InvalidRequest::new(
                         "Failed to parse HTTP request into valid UTF-8.",
                     ));
                 }
             };
             let crlf = "\r\n";
             let mut head_split_crlf = head_str.split(crlf);
-            let mut first_line_items = head_split_crlf.next().unwrap().split(' ');
-            let method_str = first_line_items.next().unwrap();
-            let uri = first_line_items.next().unwrap().to_string();
-            let http_version = first_line_items.next().unwrap().to_string();
-            let method = match method_str {
-                "GET" => RequestMethod::GET,
-                "HEAD" => RequestMethod::HEAD,
-                "POST" => RequestMethod::POST,
-                "PUT" => RequestMethod::PUT,
-                "DELETE" => RequestMethod::DELETE,
-                "CONNECT" => RequestMethod::CONNECT,
-                "OPTIONS" => RequestMethod::OPTIONS,
-                "TRACE" => RequestMethod::TRACE,
-                "PATCH" => RequestMethod::PATCH,
-                // TODO: return error when this happens
-                _ => {
-                    return Err(HTTPError::RequestParseError::new(
-                        "Failed to find a valid HTTP request method.",
+            let first_line = head_split_crlf.next().unwrap();
+
+            // Use lazy_static to only compile this Regex once.
+            lazy_static! {
+                static ref RE: Regex = Regex::new(r"^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH) (/.*?) (HTTP/\d\.\d)$").unwrap();
+            }
+
+            match RE.captures(first_line) {
+                Some(caps) => {
+                    let method_str = caps.get(1).unwrap().as_str();
+                    let method = RequestMethod::from_str(method_str)?;
+                    let uri = String::from(caps.get(2).unwrap().as_str());
+                    let http_version = String::from(caps.get(3).unwrap().as_str());
+                    let mut headers = HashMap::new();
+                    for header in head_split_crlf {
+                        let k = header.split(": ").nth(0).unwrap().to_string();
+                        let v = header.split(": ").nth(1).unwrap().to_string();
+                        headers.insert(k, v);
+                    }
+                    Ok(Request {
+                        method,
+                        uri,
+                        http_version,
+                        headers: Some(headers),
+                        body,
+                    })
+                    }
+                None => {
+                    return Err(HTTPError::InvalidRequest::new(
+                        &format!("Something is not right with this request line. {}", first_line),
                     ))
                 }
-            };
-            // everything after the host should be
-            let mut headers = HashMap::new();
-            for header in head_split_crlf {
-                let k = header.split(": ").nth(0).unwrap().to_string();
-                let v = header.split(": ").nth(1).unwrap().to_string();
-                headers.insert(k, v);
             }
-            Ok(Request {
-                method,
-                uri,
-                http_version,
-                headers: Some(headers),
-                body,
-            })
         }
     }
 
@@ -186,8 +209,8 @@ pub mod HTTP {
             self
         }
 
-        pub fn with_body(mut self, body: Vec<u8>) -> Response {
-            self.body = Some(body);
+        pub fn with_body(mut self, body: &[u8]) -> Response {
+            self.body = Some(body.to_vec());
             self
         }
 
@@ -229,41 +252,64 @@ pub mod HTTP {
             write!(f, "{}", text)
         }
     }
-
-    pub enum FileAccessPolicy {
-        AllowAll,
-        RestrictUp,
+    
+    // create a newtype to improve readability
+    pub struct ResponseGenerator(Arc<Box<dyn Send + Sync + Fn(Request) -> Response>>);
+    
+    impl ResponseGenerator {
+        pub fn new(f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> ResponseGenerator {
+            ResponseGenerator (
+                Arc::new(f)
+            )
+        }
+        
+        pub fn from_file(path: &str) -> ResponseGenerator {
+            let path_owned = path.to_string();
+            let func = move |_req| {
+                let bytes = fs::read(&path_owned);
+                match bytes {
+                    Ok(bytes) => Response::new().with_body(&bytes).prepare_response(),
+                    // TODO: log an error here, the file_response_generator should
+                    // never be initialized with a wrong path.
+                    Err(e) => {
+                        println!("Error opening path {}: {}", &path_owned, e);
+                        not_found_response()
+                    }
+                }
+            };
+            ResponseGenerator::new(Box::new(func))
+        }
     }
 
-    type ResponseGenerator = Arc<Box<dyn Send + Sync + Fn(Request) -> Response>>;
+    fn forbidden_response() -> Response {
+        let body = b"<!DOCTYPE html><html><body><h1>403 FORBIDDEN</h1></body></html>";
+        Response::new() 
+            .with_status(StatusCodes::FORBIDDEN)
+            .with_body(body)
+            .prepare_response()
+    }
 
-    pub fn new_response_generator(
-        f: Box<dyn Send + Sync + Fn(Request) -> Response>,
-    ) -> ResponseGenerator {
-        Arc::new(f)
+    fn not_found_response() -> Response {
+        let body = b"<!DOCTYPE html><html><body><h1>404 NOT FOUND</h1></body></html>";
+        Response::new()
+            .with_status(StatusCodes::NOT_FOUND)
+            .with_body(body)
+            .prepare_response()
+    }
+
+    pub enum ServerAccessPolicy {
+        AllowAll, // Serve whatever file is requested.
+        RestrictUp, // Serve anything that is in the web dir or deeper.
+        Restricted, // Only serve on routed paths.
     }
 
     pub struct Server {
         pub thread_pool: ThreadPool,
-        // TODO: maybe this arc/mutex doesn't need to be there,
-        // since the adding of routes should only ever be
-        // done all at once in one thread.
         pub routes: HashMap<String, ResponseGenerator>,
-        pub access_policy: FileAccessPolicy,
+        pub access_policy: ServerAccessPolicy,
         pub bind_addr: String,
         listener: TcpListener,
-    }
-
-    fn not_found_response() -> Response {
-        Response::new()
-            .with_status(StatusCodes::NOT_FOUND)
-            .with_body(
-                b"<!DOCTYPE html>
-                            <html><body><h1>404 NOT FOUND</h1></body>
-                            </html>"
-                    .to_vec(),
-            )
-            .prepare_response()
+        running_path: PathBuf,
     }
 
     impl Server {
@@ -271,14 +317,14 @@ pub mod HTTP {
             Server {
                 thread_pool: ThreadPool::new(1),
                 routes: HashMap::new(),
-                access_policy: FileAccessPolicy::AllowAll,
+                access_policy: ServerAccessPolicy::Restricted,
                 bind_addr: addr.to_string(),
                 listener: TcpListener::bind(addr).unwrap(),
+                running_path: PathBuf::new(),
             }
-            // Bind 404 by default, can be overwritten:
-            .with_route(
-                "/404",
-                Arc::new(Box::new(|_req| not_found_response())),
+            // Bind 403 and 404 by default, can be overwritten:
+            .with_route("/403", Box::new(|_req| forbidden_response()))
+            .with_route("/404",Box::new(|_req| not_found_response()),
             )
         }
 
@@ -289,8 +335,13 @@ pub mod HTTP {
             self
         }
 
-        pub fn with_route(mut self, route: &str, response: ResponseGenerator) -> Server {
-            self.routes.insert(route.to_string(), response);
+        pub fn with_route(mut self, route: &str, f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> Server {
+            self.routes.insert(route.to_string(), ResponseGenerator::new(f));
+            self
+        }
+
+        pub fn with_route_to_file(mut self, route: &str, path: &str) -> Server { 
+            self.routes.insert(route.to_string(), ResponseGenerator::from_file(path));
             self
         }
 
@@ -299,16 +350,28 @@ pub mod HTTP {
             self
         }
 
-        pub fn start(self) {
+        pub fn with_access_policy(mut self, policy: ServerAccessPolicy) -> Server {
+            self.access_policy = policy;
+            self
+        }
+
+        pub fn start(mut self) {
+            // Set the running path and panic if the current dir cannot
+            // be gotten from the system.
+            self.running_path = env::current_dir().unwrap();
+            println!("Running path set to: {:?}", self.running_path);
             for stream in self.listener.incoming() {
+                // TODO: remove this unwrap!!
                 let stream = stream.unwrap();
                 match Server::http_request_from_tcp_stream(stream) {
                     Ok((request, stream)) => {
                         println!("[New Request] {}", request);
-                        let route_fn = match self.routes.get(&request.uri) {
-                            Some(func) => Arc::clone(func),
-                            None => Arc::clone(self.routes.get("/404").unwrap()),
+                        let unknown_route_handler = self.get_unknown_route_handler(&request.uri);
+                        let response_generator = match self.routes.get(&request.uri) {
+                            Some(route_response) => route_response,
+                            None => &unknown_route_handler,
                         };
+                        let route_fn = Arc::clone(&response_generator.0);
                         self.thread_pool.execute(move || {
                             let http_response = route_fn(request);
                             Server::send_http_response_over_tcp(stream, http_response);
@@ -319,9 +382,58 @@ pub mod HTTP {
             }
         }
 
+        fn file_within_running_path(&self, requested_file: &Path) -> bool {
+            let mut result = false;
+            let mut buff = PathBuf::from(requested_file);
+            buff.pop();
+            // Check if the buffer is empty: this means that the file is in the current directory.
+            if buff.iter().next() == None {
+                result = true;
+            }
+            // Change the directory to the requested file's directory, so that
+            // we can extract the path to that file from env::current_dir. Then
+            // we know that the file is contained within the running path if it
+            // is contained within the path to the file that is being accessed.'
+            // TODO: make sure this solution is fast enough for a webserver.
+            if let Ok(_) = env::set_current_dir(buff) {
+                if let Ok(cur_dir) = env::current_dir() {
+                    if let Some(cur_dir_str) = cur_dir.to_str() {
+                        if let Some(running_path_str) = self.running_path.to_str() {
+                            if cur_dir_str.contains(running_path_str) {
+                                result = true;
+                            }
+                        }
+                    }
+                }
+            }
+            env::set_current_dir(&self.running_path).unwrap();
+            result
+        }
+
+        fn get_unknown_route_handler(&self, uri: &str) -> ResponseGenerator {
+            // Strip the leading "/" from the uri.
+            let uri_stripped = &uri.to_string()[1..];
+            match self.access_policy {
+                ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(uri_stripped),
+                ServerAccessPolicy::RestrictUp => {
+                    if let Ok(requested_file) = PathBuf::from_str(uri_stripped) {
+                        if self.file_within_running_path(&requested_file) {
+                            return ResponseGenerator::from_file(requested_file.to_str().unwrap());
+                        } else {
+                            println!("Requested file is {:?}, which is not in running dir", &requested_file);
+                            return ResponseGenerator::new(Box::new(|_| { forbidden_response() }));
+                        }
+                    }
+                    return ResponseGenerator::new(Box::new(|_| { not_found_response() }));
+                },
+                // RestrictAll policy sends back a 404 for any unknown paths.
+                ServerAccessPolicy::Restricted => ResponseGenerator::new(Box::new(|_| { not_found_response() })),
+            }
+        }
+
         fn http_request_from_tcp_stream(
             mut stream: TcpStream,
-        ) -> Result<(Request, TcpStream), HTTPError::RequestParseError> {
+        ) -> Result<(Request, TcpStream), HTTPError::InvalidRequest> {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
             while let Ok(bytes_read) = stream.read(&mut buffer) {
@@ -343,22 +455,5 @@ pub mod HTTP {
             stream.write_all(&response.message_bytes()).unwrap();
             stream.flush().unwrap();
         }
-    }
-
-    pub fn file_response_generator(path: &str) -> ResponseGenerator {
-        let path_owned = path.to_string();
-        let func = move |_req| {
-            let bytes = fs::read(&path_owned);
-            match bytes {
-                Ok(bytes) => Response::new().with_body(bytes).prepare_response(),
-                // TODO: log an error here, the file_response_generator should
-                // never be initialized with a wrong path.
-                Err(e) => {
-                    println!("Error opening path {}: {}", &path_owned, e);
-                    not_found_response()
-                }
-            }
-        };
-        new_response_generator(Box::new(func))
     }
 }
