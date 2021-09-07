@@ -369,11 +369,12 @@ pub mod HTTP {
         }
 
         pub fn start(mut self) {
+            self.panic_on_missing_mandatory_routes();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
             println!("Running path set to: {:?}", self.running_path);
-            self.panic_on_missing_mandatory_routes();
+            println!("Now serving at {}", self.bind_addr);
             self.handle_connections();
         }
 
