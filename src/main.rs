@@ -22,13 +22,6 @@ fn say_hello(req: HTTP::Request) -> HTTP::Response {
     return HTTP::Response::new().with_body(&body).prepare_response();
 }
 
-fn slp(_: HTTP::Request) -> HTTP::Response {
-    sleep(Duration::from_secs(5));
-    HTTP::Response::new()
-        .with_body(&fs::read("res/index.html").unwrap())
-        .prepare_response()
-}
-
 fn main() {
     let thread_count = 4;
 
@@ -41,6 +34,5 @@ fn main() {
         .with_route_to_file("/favicon", "res/favicon.png")
         .with_route_to_file("/img", "res/smile.png")
         .with_route("/name", Box::new(say_hello))
-        .with_route("/sleep", Box::new(slp))
         .start();
 }

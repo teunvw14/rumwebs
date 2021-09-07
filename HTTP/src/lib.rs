@@ -269,8 +269,8 @@ pub mod HTTP {
                 let bytes = fs::read(&path_owned);
                 match bytes {
                     Ok(bytes) => Response::new().with_body(&bytes).prepare_response(),
-                    // TODO: log an error here, the file_response_generator should
-                    // never be initialized with a wrong path.
+                    // TODO: maybe panic here since the caller of this function
+                    // expects it to work if it returns.
                     Err(e) => {
                         println!("Error opening path {}: {}", &path_owned, e);
                         not_found_response()
@@ -493,9 +493,14 @@ pub mod HTTP {
         }
 
         fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
-            // TODO: remove these unwraps!!!
-            stream.write_all(&response.message_bytes()).unwrap();
-            stream.flush().unwrap();
+            if let Err(e) stream.write_all(&response.message_bytes()) {
+                println!("! Something went wrong sending a response.");
+                return;
+            };
+            if let Err(e) = stream.flush() {
+                println!("! Something went wrong flushing the response.");
+                return;
+            }
         }
     }
 }
