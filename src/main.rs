@@ -9,7 +9,7 @@ use rumwebs_http::HTTP;
 
 fn main() {
     // Initialize logging:
-    SimpleLogger::init(LevelFilter::Trace, Config::default()).unwrap();
+    SimpleLogger::init(LevelFilter::Debug, Config::default()).unwrap();
 
     let thread_count = 4;
 
