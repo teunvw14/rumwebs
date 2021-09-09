@@ -4,14 +4,14 @@ pub mod HTTP {
     pub mod RequestMethods;
     pub mod StatusCodes;
 
-    use std::net::{ TcpListener, TcpStream, SocketAddr };
+    use std::net::{ TcpListener, TcpStream };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::io::prelude::*;
     use std::time::Duration;
-    use std::{error, fmt};
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::fmt;
     use std::env;
     use std::fs;
     
@@ -504,7 +504,7 @@ pub mod HTTP {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
             if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
-                error!("Something went wrong setting the stream read timeout.");
+                error!("Something went wrong setting the stream read timeout: {}", e);
                 return Err(HTTPError::InvalidRequest::new("Couldn't set read timeout on TCP stream."))
             };
             while let Ok(bytes_read) = stream.read(&mut buffer) {
