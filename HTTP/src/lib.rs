@@ -422,6 +422,7 @@ pub mod HTTP {
                         let unknown_route_handler;
                         let response_generator;
                         let mut request = Request::new();
+                        trace!("Parsing HTTP request from stream...");
                         match Server::http_request_from_tcp_stream(&mut stream) {
                             Ok(req) => {
                                 request = req;
@@ -433,6 +434,7 @@ pub mod HTTP {
                                 };
                             }
                             Err(_) => {
+                                error!("Got invalid HTTP request, sending back HTTP 400.");
                                 response_generator = self.routes.get("/400").unwrap();
                             },
                         }
