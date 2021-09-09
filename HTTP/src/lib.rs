@@ -311,64 +311,78 @@ pub mod HTTP {
         Restricted, // Only serve on routed paths.
     }
 
+    pub struct ServerBuilder {
+        server: Server,
+    }
+
+    impl ServerBuilder {
+        pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
+            // Drop thread pool to make sure all
+            // threads finish their tasks.
+            self.server.thread_pool.set_thread_count(count);
+            self
+        }
+
+        pub fn add_route(mut self, route: &str, f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> ServerBuilder {
+            self.server.routes.insert(route.to_string(), ResponseGenerator::new(f));
+            self
+        }
+
+        pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder { 
+            self.server.routes.insert(route.to_string(), ResponseGenerator::from_file(path));
+            self
+        }
+
+        pub fn add_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> ServerBuilder {
+            // Add (so not replace) server routes.
+            for (route, response) in routes {
+                self.server.routes.insert(route, response);
+            };
+            self
+        }
+
+        pub fn with_access_policy(mut self, policy: ServerAccessPolicy) -> ServerBuilder {
+            self.server.access_policy = policy;
+            self
+        }
+
+        pub fn bind(mut self, addr: &str) -> Server {
+            self.server.bind_addr = String::from(addr);
+            self.server.listener = Some(TcpListener::bind(addr).unwrap());
+            // Route 400, 403 and 404 by default, as they are necessary for the
+            // server to function. They can be overwritten.
+            self
+            .add_route("/400", Box::new(|_req| bad_request_response()))
+            .add_route("/403", Box::new(|_req| forbidden_response()))
+            .add_route("/404",Box::new(|_req| not_found_response()))
+            .server
+        }
+    }
+
     pub struct Server {
         pub thread_pool: ThreadPool,
         pub routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
         pub bind_addr: String,
-        listener: TcpListener,
+        listener: Option<TcpListener>,
         running_path: PathBuf,
     }
 
     impl Server {
-        pub fn bind(addr: &str) -> Server {
-            Server {
-                thread_pool: ThreadPool::new(1),
-                routes: HashMap::new(),
-                access_policy: ServerAccessPolicy::Restricted,
-                bind_addr: addr.to_string(),
-                listener: TcpListener::bind(addr).unwrap(),
-                running_path: PathBuf::new(),
+        pub fn builder() -> ServerBuilder {
+            ServerBuilder {
+                server: Server {
+                    thread_pool: ThreadPool::new(1),
+                    routes: HashMap::new(),
+                    access_policy: ServerAccessPolicy::Restricted,
+                    bind_addr: String::new(),
+                    listener: None,
+                    running_path: PathBuf::new(),
+                }
             }
-            // Bind 400, 403 and 404 by default, as they are necessary for the
-            // server to function. They can be overwritten.
-            .with_route("/400", Box::new(|_req| bad_request_response()))
-            .with_route("/403", Box::new(|_req| forbidden_response()))
-            .with_route("/404",Box::new(|_req| not_found_response()),
-            )
         }
 
-        pub fn with_thread_count(mut self, count: usize) -> Server {
-            // Drop thread pool to make sure all
-            // threads finish their tasks.
-            self.thread_pool.set_thread_count(count);
-            self
-        }
-
-        pub fn with_route(mut self, route: &str, f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> Server {
-            self.routes.insert(route.to_string(), ResponseGenerator::new(f));
-            self
-        }
-
-        pub fn with_route_to_file(mut self, route: &str, path: &str) -> Server { 
-            self.routes.insert(route.to_string(), ResponseGenerator::from_file(path));
-            self
-        }
-
-        pub fn with_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> Server {
-            // Add (so not replace) server routes.
-            for (route, response) in routes {
-                self.routes.insert(route, response);
-            };
-            self
-        }
-
-        pub fn with_access_policy(mut self, policy: ServerAccessPolicy) -> Server {
-            self.access_policy = policy;
-            self
-        }
-
-        pub fn start(mut self) {
+        pub fn start(&mut self) {
             self.panic_on_missing_mandatory_routes();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
@@ -390,8 +404,10 @@ pub mod HTTP {
             }
         }
 
-        fn handle_connections(self) {
-            for stream in self.listener.incoming() {
+        fn handle_connections(&self) {
+            // Unwrap here because the server is expected to have a working
+            // TcpListener set up when this function is called.
+            for stream in self.listener.as_ref().unwrap().incoming() {
                 // If something went wrong dealing with the stream, we don't
                 // want to send back data, so we continue the loop to the next
                 // incoming connection.
@@ -494,11 +510,11 @@ pub mod HTTP {
 
         fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
             if let Err(e) = stream.write_all(&response.message_bytes()) {
-                println!("! Something went wrong sending a response.");
+                println!("! Something went wrong sending a response: {}", e);
                 return;
             };
             if let Err(e) = stream.flush() {
-                println!("! Something went wrong flushing the response.");
+                println!("! Something went wrong flushing the response: {}", e);
                 return;
             }
         }
