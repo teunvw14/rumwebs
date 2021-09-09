@@ -434,8 +434,8 @@ pub mod HTTP {
                                     None => &unknown_route_handler,
                                 };
                             }
-                            Err(_) => {
-                                error!("Got invalid HTTP request, sending back HTTP 400.");
+                            Err(e) => {
+                                error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
                                 response_generator = self.routes.get("/400").unwrap();
                             },
                         }
