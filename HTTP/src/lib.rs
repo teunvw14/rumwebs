@@ -503,7 +503,10 @@ pub mod HTTP {
         ) -> Result<Request, HTTPError::InvalidRequest> {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
-            
+            if let Err(e) = stream.set_read_timeout(Duration::from_millis(500)) {
+                error!("Something went wrong setting the stream read timeout.");
+                return Err(HTTPError::InvalidRequest::new("Couldn't set read timeout on TCP stream."))
+            };
             while let Ok(bytes_read) = stream.read(&mut buffer) {
                 for i in 0..bytes_read {
                     bytes_vec.push(buffer[i]);
