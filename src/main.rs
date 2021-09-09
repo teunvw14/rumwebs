@@ -1,3 +1,9 @@
+#[macro_use]
+extern crate log;
+extern crate simplelog;
+
+use simplelog::*;
+
 extern crate rumwebs_http;
 use rumwebs_http::HTTP;
 
@@ -19,9 +25,12 @@ fn say_hello(req: HTTP::Request) -> HTTP::Response {
 }
 
 fn main() {
+    // Initialize logging:
+    SimpleLogger::init(LevelFilter::Trace, Config::default()).unwrap();
+
     let thread_count = 4;
 
-    println!("Starting server with {} threads...", thread_count);
+    info!("Starting server with {} threads...", thread_count);
     // Bind server to localhost:
     let mut server = HTTP::Server::builder()
         // .with_access_policy(HTTP::ServerAccessPolicy::RestrictUp)

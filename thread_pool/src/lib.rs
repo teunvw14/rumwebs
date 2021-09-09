@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
+use log::{info, debug};
+
 enum WorkerMessage {
     NewJob(Job),
     Shutdown,
@@ -22,7 +24,7 @@ impl Worker {
                     job();
                 }
                 WorkerMessage::Shutdown => {
-                    println!(
+                    debug!(
                         "Worker {} received shutdown message, terminating thread.",
                         id
                     );
@@ -104,7 +106,7 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        println!("Shutting down all workers.");
+        info!("Shutting down all ThreadPool workers.");
 
         for _ in &self.workers {
             self.sender.send(WorkerMessage::Shutdown).unwrap();

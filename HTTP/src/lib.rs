@@ -5,17 +5,17 @@ pub mod HTTP {
     pub mod StatusCodes;
 
     use std::collections::HashMap;
-    use std::net::TcpListener;
-    use std::net::TcpStream;
+    use std::net::{ TcpListener, TcpStream, SocketAddr};
     use std::io::prelude::*;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::fmt;
+    use std::{error, fmt};
     use std::env;
     use std::fs;
     
     use lazy_static::lazy_static;
+    use log::{error, info, debug, trace};
     use regex::Regex;
 
     use rumwebs_threadpool::ThreadPool;
@@ -166,7 +166,7 @@ pub mod HTTP {
 
     impl fmt::Display for Request {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "{} request to {}", self.method, self.uri)
+            write!(f, "{} {} {}", self.method, self.uri, self.http_version)
         }
     }
 
@@ -272,7 +272,7 @@ pub mod HTTP {
                     // TODO: maybe panic here since the caller of this function
                     // expects it to work if it returns.
                     Err(e) => {
-                        println!("Error opening path {}: {}", &path_owned, e);
+                        error!("Error opening path {}: {}", &path_owned, e);
                         not_found_response()
                     }
                 }
@@ -328,7 +328,7 @@ pub mod HTTP {
             self
         }
 
-        pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder { 
+        pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder {
             self.server.routes.insert(route.to_string(), ResponseGenerator::from_file(path));
             self
         }
@@ -387,8 +387,8 @@ pub mod HTTP {
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
-            println!("Running path set to: {:?}", self.running_path);
-            println!("Now serving at {}", self.bind_addr);
+            info!("Running path set to: {:?}", self.running_path);
+            info!("Now serving at {}", self.bind_addr);
             self.handle_connections();
         }
 
@@ -408,35 +408,41 @@ pub mod HTTP {
             // Unwrap here because the server is expected to have a working
             // TcpListener set up when this function is called.
             for stream in self.listener.as_ref().unwrap().incoming() {
+                trace!("Got new incoming TCP stream.");
                 // If something went wrong dealing with the stream, we don't
                 // want to send back data, so we continue the loop to the next
                 // incoming connection.
-                if let Err(_) = stream {
-                    continue;
-                }
-                let mut stream = stream.unwrap();
-                let unknown_route_handler;
-                let response_generator;
-                let mut request = Request::new();
-                match Server::http_request_from_tcp_stream(&mut stream) {
-                    Ok(req) => {
-                        request = req;
-                        println!("[New Request] {}", request);
-                        unknown_route_handler = self.get_unknown_route_handler(&request.uri);
-                        response_generator = match self.routes.get(&request.uri) {
-                            Some(route_response) => route_response,
-                            None => &unknown_route_handler,
-                        };
+                match stream {
+                    Err(e) => {
+                        error!("Unable to open stream, got error {}", e);
+                        continue;
                     }
-                    Err(_) => {
-                        response_generator = self.routes.get("/400").unwrap();
-                    },
+                    Ok(mut stream) => {
+                        trace!("TCP stream incoming from {}.", stream.peer_addr().unwrap());
+                        let unknown_route_handler;
+                        let response_generator;
+                        let mut request = Request::new();
+                        match Server::http_request_from_tcp_stream(&mut stream) {
+                            Ok(req) => {
+                                request = req;
+                                debug!(r#"New Request "{}""#, request);
+                                unknown_route_handler = self.get_unknown_route_handler(&request.uri);
+                                response_generator = match self.routes.get(&request.uri) {
+                                    Some(route_response) => route_response,
+                                    None => &unknown_route_handler,
+                                };
+                            }
+                            Err(_) => {
+                                response_generator = self.routes.get("/400").unwrap();
+                            },
+                        }
+                        let response_fn = Arc::clone(&response_generator.0);
+                        self.thread_pool.execute(move || {
+                            let http_response = response_fn(request);
+                            Server::send_http_response_over_tcp(stream, http_response);
+                        })
+                    }
                 }
-                let response_fn = Arc::clone(&response_generator.0);
-                self.thread_pool.execute(move || {
-                    let http_response = response_fn(request);
-                    Server::send_http_response_over_tcp(stream, http_response);
-                })
             }
         }
 
@@ -478,7 +484,7 @@ pub mod HTTP {
                         if self.file_within_running_path(&requested_file) {
                             return ResponseGenerator::from_file(requested_file.to_str().unwrap());
                         } else {
-                            println!("Requested file is {:?}, which is not in running dir", &requested_file);
+                            debug!("Illegal file request, '{:?}' is not in running dir.", &requested_file);
                             return ResponseGenerator::new(Box::new(|_| { forbidden_response() }));
                         }
                     }
@@ -510,11 +516,11 @@ pub mod HTTP {
 
         fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
             if let Err(e) = stream.write_all(&response.message_bytes()) {
-                println!("! Something went wrong sending a response: {}", e);
+                error!("! Something went wrong sending a response: {}", e);
                 return;
             };
             if let Err(e) = stream.flush() {
-                println!("! Something went wrong flushing the response: {}", e);
+                error!("! Something went wrong flushing the response: {}", e);
                 return;
             }
         }
