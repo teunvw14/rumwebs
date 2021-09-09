@@ -4,13 +4,14 @@ pub mod HTTP {
     pub mod RequestMethods;
     pub mod StatusCodes;
 
+    use std::net::{ TcpListener, TcpStream, SocketAddr };
     use std::collections::HashMap;
-    use std::net::{ TcpListener, TcpStream, SocketAddr};
-    use std::io::prelude::*;
     use std::path::{Path, PathBuf};
+    use std::io::prelude::*;
+    use std::time::Duration;
+    use std::{error, fmt};
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::{error, fmt};
     use std::env;
     use std::fs;
     
@@ -502,6 +503,7 @@ pub mod HTTP {
         ) -> Result<Request, HTTPError::InvalidRequest> {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
+            
             while let Ok(bytes_read) = stream.read(&mut buffer) {
                 for i in 0..bytes_read {
                     bytes_vec.push(buffer[i]);
