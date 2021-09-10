@@ -1,0 +1,10 @@
+[server]
+ip = "127.0.0.1"
+http_port = 7878
+tls_port = 443
+tls_enabled = false
+tls_cert_fullchain = ""
+tls_cert_privkey = ""
+
+[application]
+thread_count = 4

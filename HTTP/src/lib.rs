@@ -8,6 +8,7 @@ pub mod HTTP {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::io::prelude::*;
+    use std::io::BufReader;
     use std::time::Duration;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -18,6 +19,8 @@ pub mod HTTP {
     use lazy_static::lazy_static;
     use log::{error, info, debug, trace};
     use regex::Regex;
+    use rustls;
+    use rustls::internal::pemfile::*;
 
     use rumwebs_threadpool::ThreadPool;
 
@@ -317,6 +320,25 @@ pub mod HTTP {
     }
 
     impl ServerBuilder {
+        pub fn set_tls(mut self, tls_enabled: bool, fullchain_path: &str, privkey_path: &str) -> ServerBuilder {
+            self.server.tls_enabled = tls_enabled;
+            if tls_enabled {
+                let mut cert_file = BufReader::new(fs::File::open(fullchain_path)
+                .expect(&format!("Unable to open certificate fullchain path '{}'.", fullchain_path)));
+                let cert_chain = certs(&mut cert_file).unwrap();
+                let mut key_file = BufReader::new(fs::File::open(privkey_path)
+                .expect(&format!("Unable to open certificate privkey path '{}'.", fullchain_path)));
+                let mut keys = pkcs8_private_keys(&mut key_file).unwrap();
+                // Should be only one key so we can pop from the keys vector.
+                let key_der = keys.pop().unwrap();
+                // Build the config with the opened certificates:
+                let mut config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
+                config.set_single_cert(cert_chain, key_der);
+                self.server.tls_config = Some(Arc::new(config));
+            }
+            self
+        }
+
         pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
             // Drop thread pool to make sure all
             // threads finish their tasks.
@@ -365,7 +387,9 @@ pub mod HTTP {
         pub routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
         pub bind_addr: String,
+        pub tls_enabled: bool,
         listener: Option<TcpListener>,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
         running_path: PathBuf,
     }
 
@@ -377,13 +401,16 @@ pub mod HTTP {
                     routes: HashMap::new(),
                     access_policy: ServerAccessPolicy::Restricted,
                     bind_addr: String::new(),
+                    tls_enabled: false,
                     listener: None,
+                    tls_config: None,
                     running_path: PathBuf::new(),
                 }
             }
         }
 
         pub fn start(&mut self) {
+            self.panic_on_tls_without_certificates();
             self.panic_on_missing_mandatory_routes();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
@@ -391,6 +418,12 @@ pub mod HTTP {
             info!("Running path set to: {:?}", self.running_path);
             info!("Now serving at {}", self.bind_addr);
             self.handle_connections();
+        }
+
+        fn panic_on_tls_without_certificates(&self) {
+            if self.tls_enabled && self.tls_config.is_none() {
+                panic!("TLS was enabled, but no certificates were supplied.");
+            }
         }
 
         fn panic_on_missing_mandatory_routes(&self) {
