@@ -4,6 +4,7 @@ pub mod HTTP {
     pub mod RequestMethods;
     pub mod StatusCodes;
 
+    use std::error::Error;
     use std::net::{ TcpListener, TcpStream };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -11,10 +12,12 @@ pub mod HTTP {
     use std::io::BufReader;
     use std::time::Duration;
     use std::str::FromStr;
+    use std::sync::Mutex;
     use std::sync::Arc;
     use std::fmt;
     use std::env;
     use std::fs;
+    use std::io;
     
     use lazy_static::lazy_static;
     use log::{error, info, debug, trace};
@@ -258,6 +261,7 @@ pub mod HTTP {
     }
     
     // create a newtype to improve readability
+    #[derive(Clone)]
     pub struct ResponseGenerator(Arc<Box<dyn Send + Sync + Fn(Request) -> Response>>);
     
     impl ResponseGenerator {
@@ -309,6 +313,7 @@ pub mod HTTP {
             .prepare_response()
     }
 
+    #[derive(Clone)]
     pub enum ServerAccessPolicy {
         AllowAll, // Serve whatever file is requested.
         RestrictUp, // Serve anything that is in the web dir or deeper.
@@ -347,19 +352,19 @@ pub mod HTTP {
         }
 
         pub fn add_route(mut self, route: &str, f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> ServerBuilder {
-            self.server.routes.insert(route.to_string(), ResponseGenerator::new(f));
+            self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::new(f));
             self
         }
 
         pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder {
-            self.server.routes.insert(route.to_string(), ResponseGenerator::from_file(path));
+            self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::from_file(path));
             self
         }
 
         pub fn add_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> ServerBuilder {
             // Add (so not replace) server routes.
             for (route, response) in routes {
-                self.server.routes.insert(route, response);
+                self.server.unfinished_routes.insert(route, response);
             };
             self
         }
@@ -384,7 +389,8 @@ pub mod HTTP {
 
     pub struct Server {
         pub thread_pool: ThreadPool,
-        pub routes: HashMap<String, ResponseGenerator>,
+        pub routes: Arc<HashMap<String, ResponseGenerator>>,
+        unfinished_routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
         pub bind_addr: String,
         pub tls_enabled: bool,
@@ -398,7 +404,8 @@ pub mod HTTP {
             ServerBuilder {
                 server: Server {
                     thread_pool: ThreadPool::new(1),
-                    routes: HashMap::new(),
+                    routes: Arc::new(HashMap::new()),
+                    unfinished_routes: HashMap::new(),
                     access_policy: ServerAccessPolicy::Restricted,
                     bind_addr: String::new(),
                     tls_enabled: false,
@@ -410,6 +417,7 @@ pub mod HTTP {
         }
 
         pub fn start(&mut self) {
+            self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
             self.panic_on_missing_mandatory_routes();
             // Set the running path and panic if the current dir cannot
@@ -438,51 +446,108 @@ pub mod HTTP {
             }
         }
 
+        fn handle_request_tls(&self, mut tcp_stream: TcpStream) {
+            trace!("Parsing HTTP request from stream...");
+            let server = Arc::clone(&self.tls_config.as_ref().unwrap());
+            let running_path = self.running_path.clone();
+            let access_policy = self.access_policy.clone();
+            let routes = Arc::clone(&self.routes);
+
+            self.thread_pool.execute(move || {
+                let mut session = rustls::ServerSession::new(&server);
+                let mut stream = rustls::Stream::new(&mut session, &mut tcp_stream);
+                let parsed_request = Server::http_request_from_stream(&mut stream);
+                let mut request = Request::new();
+                let unknown_route_handler;
+                let response_generator = match parsed_request {
+                    Ok(req) => {
+                        // TODO: maybe remove this line (seems unnecessary)
+                        request = req;
+                        debug!(r#"New Request "{}""#, request);
+                        match routes.get(&request.uri) {
+                            Some(route_response) => route_response,
+                            None => {
+                                unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &access_policy, &running_path);
+                                &unknown_route_handler
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
+                        routes.get("/400").unwrap()
+                    },
+                };
+                let response_fn = Arc::clone(&response_generator.0);
+                let http_response = response_fn(request);
+                // let http_response = Response::new().with_status(StatusCodes::OK)
+                // .with_body(b"<!DOCTYPE html><html><body><h1>Hello world!</h1></body></html>")
+                // .prepare_response();
+                // trace!("Sending response: {}", http_response);
+                Server::send_http_response_to_stream(stream, http_response);
+            })
+        }
+
+        fn handle_request_no_tls(&self, mut tcp_stream: TcpStream) {
+            trace!("Parsing HTTP request from stream...");
+            let parsed_request = Server::http_request_from_stream(&mut tcp_stream);
+            let mut request = Request::new();
+            let unknown_route_handler;
+            let response_generator = match parsed_request {
+                Ok(req) => {
+                    // TODO: maybe remove this line (seems unnecessary)
+                    request = req;
+                    debug!(r#"New Request "{}""#, request);
+                    match self.routes.get(&request.uri) {
+                        Some(route_response) => route_response,
+                        None => {
+                            unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &self.access_policy, &self.running_path);
+                            &unknown_route_handler
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
+                    self.routes.get("/400").unwrap()
+                },
+            };
+            let response_fn = Arc::clone(&response_generator.0);
+            self.thread_pool.execute(move || {
+                let http_response = response_fn(request);
+                Server::send_http_response_to_stream(tcp_stream, http_response);
+            })
+        }
+
         fn handle_connections(&self) {
             // Unwrap here because the server is expected to have a working
             // TcpListener set up when this function is called.
-            for stream in self.listener.as_ref().unwrap().incoming() {
+            for tcp_stream in self.listener.as_ref().unwrap().incoming() {
                 trace!("Got new incoming TCP stream.");
                 // If something went wrong dealing with the stream, we don't
                 // want to send back data, so we continue the loop to the next
                 // incoming connection.
-                match stream {
+                match tcp_stream {
                     Err(e) => {
                         error!("Unable to open stream, got error {}", e);
                         continue;
                     }
-                    Ok(mut stream) => {
-                        trace!("TCP stream incoming from {}.", stream.peer_addr().unwrap());
-                        let unknown_route_handler;
-                        let response_generator;
-                        let mut request = Request::new();
-                        trace!("Parsing HTTP request from stream...");
-                        match Server::http_request_from_tcp_stream(&mut stream) {
-                            Ok(req) => {
-                                request = req;
-                                debug!(r#"New Request "{}""#, request);
-                                unknown_route_handler = self.get_unknown_route_handler(&request.uri);
-                                response_generator = match self.routes.get(&request.uri) {
-                                    Some(route_response) => route_response,
-                                    None => &unknown_route_handler,
-                                };
-                            }
-                            Err(e) => {
-                                error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
-                                response_generator = self.routes.get("/400").unwrap();
-                            },
+                    Ok(tcp_stream) => {
+                        trace!("TCP stream incoming from {}.", tcp_stream.peer_addr().unwrap());
+                        if let Err(e) = tcp_stream.set_read_timeout(Some(Duration::from_millis(500))) {
+                            error!("Something went wrong setting the stream read timeout: {}", e);
+                        };
+                        if let Err(e) = tcp_stream.set_write_timeout(Some(Duration::from_millis(500))) {
+                            error!("Something went wrong setting the stream write timeout: {}", e);
                         }
-                        let response_fn = Arc::clone(&response_generator.0);
-                        self.thread_pool.execute(move || {
-                            let http_response = response_fn(request);
-                            Server::send_http_response_over_tcp(stream, http_response);
-                        })
+                        match self.tls_enabled {
+                            false => self.handle_request_no_tls(tcp_stream),
+                            true => self.handle_request_tls(tcp_stream),
+                        }
                     }
                 }
             }
         }
 
-        fn file_within_running_path(&self, requested_file: &Path) -> bool {
+        fn file_within_running_path(running_path: &Path, requested_file: &Path) -> bool {
             let mut result = false;
             let mut buff = PathBuf::from(requested_file);
             buff.pop();
@@ -498,7 +563,7 @@ pub mod HTTP {
             if let Ok(_) = env::set_current_dir(buff) {
                 if let Ok(cur_dir) = env::current_dir() {
                     if let Some(cur_dir_str) = cur_dir.to_str() {
-                        if let Some(running_path_str) = self.running_path.to_str() {
+                        if let Some(running_path_str) = running_path.to_str() {
                             if cur_dir_str.contains(running_path_str) {
                                 result = true;
                             }
@@ -506,18 +571,18 @@ pub mod HTTP {
                     }
                 }
             }
-            env::set_current_dir(&self.running_path).unwrap();
+            env::set_current_dir(running_path).unwrap();
             result
         }
 
-        fn get_unknown_route_handler(&self, uri: &str) -> ResponseGenerator {
+        fn get_unknown_route_handler(uri: &str, access_policy: &ServerAccessPolicy, running_path: &Path) -> ResponseGenerator {
             // Strip the leading "/" from the uri.
             let uri_stripped = &uri.to_string()[1..];
-            match self.access_policy {
+            match access_policy {
                 ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(uri_stripped),
                 ServerAccessPolicy::RestrictUp => {
                     if let Ok(requested_file) = PathBuf::from_str(uri_stripped) {
-                        if self.file_within_running_path(&requested_file) {
+                        if Server::file_within_running_path(running_path, &requested_file) {
                             return ResponseGenerator::from_file(requested_file.to_str().unwrap());
                         } else {
                             debug!("Illegal file request, '{:?}' is not in running dir.", &requested_file);
@@ -531,15 +596,11 @@ pub mod HTTP {
             }
         }
 
-        fn http_request_from_tcp_stream(
-            stream: &mut TcpStream,
+        fn http_request_from_stream<T: io::Read>(
+            stream: &mut T,
         ) -> Result<Request, HTTPError::InvalidRequest> {
             let mut buffer = [0; 1024]; // 1kb buffer
             let mut bytes_vec = Vec::new();
-            if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
-                error!("Something went wrong setting the stream read timeout: {}", e);
-                return Err(HTTPError::InvalidRequest::new("Couldn't set read timeout on TCP stream."))
-            };
             while let Ok(bytes_read) = stream.read(&mut buffer) {
                 for i in 0..bytes_read {
                     bytes_vec.push(buffer[i]);
@@ -554,7 +615,7 @@ pub mod HTTP {
             }
         }
 
-        fn send_http_response_over_tcp(mut stream: TcpStream, response: Response) {
+        fn send_http_response_to_stream<T: io::Write>(mut stream: T, response: Response) {
             if let Err(e) = stream.write_all(&response.message_bytes()) {
                 error!("! Something went wrong sending a response: {}", e);
                 return;
