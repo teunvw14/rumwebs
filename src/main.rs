@@ -43,6 +43,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .clone()
         .into_bool()?;
+    let redirect_http = settings_server
+        .get("redirect_http")
+        .unwrap()
+        .clone()
+        .into_bool()?;
     let tls_cert_fullchain = settings_server
         .get("tls_cert_fullchain")
         .unwrap()
@@ -56,10 +61,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Bind server to localhost:
     let mut server = HTTP::Server::builder()
-        .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
         .with_ip(&ip)
         .with_http_port(http_port)
         .with_tls_port(tls_port)
+        .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
+        .with_http_redirection(redirect_http)
         .with_thread_count(thread_count)
         .add_route_to_file("/", "res/index.html")
         .add_route_to_file("/favicon", "res/favicon.png")

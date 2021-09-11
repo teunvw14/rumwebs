@@ -393,6 +393,11 @@ pub mod HTTP {
             self
         }
 
+        pub fn with_http_redirection(mut self, redirect_http: bool) -> ServerBuilder {
+            self.server.redirect_http = redirect_http;
+            self
+        }
+
         pub fn bind(mut self) -> Server {
             let port = match self.server.tls_enabled {
                 false => self.server.http_port,
@@ -420,6 +425,7 @@ pub mod HTTP {
         http_port: usize,
         tls_port: usize,
         pub tls_enabled: bool,
+        redirect_http: bool,
         listener: Option<TcpListener>,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         running_path: PathBuf,
@@ -438,6 +444,7 @@ pub mod HTTP {
                     http_port: 0,
                     tls_port: 0,
                     tls_enabled: false,
+                    redirect_http: false,
                     listener: None,
                     tls_config: None,
                     running_path: PathBuf::new(),
@@ -449,10 +456,13 @@ pub mod HTTP {
             self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
             self.panic_on_missing_mandatory_routes();
-            self.start_http_redirection();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
+            if self.tls_enabled && self.redirect_http {
+                info!("Starting HTTP redirection.");
+                self.start_http_redirection();
+            }
             info!("Running path set to: {:?}", self.running_path);
             info!("Now serving at {}", self.bind_addr);
             self.handle_connections();
@@ -487,27 +497,26 @@ pub mod HTTP {
         }
 
         fn start_http_redirection(&self) {
+            !warn("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             // Spawn a thread that redirects all non-TLS traffic to the TLS address.
-            if self.tls_enabled {
-                let http_addr = format!("{}:{}", self.ip, self.http_port);
-                let forwarder = TcpListener::bind(http_addr).unwrap();
-                let routes = Arc::clone(&self.routes);
-                let tls_port = self.tls_port.clone();
-                self.thread_pool.execute(move || {
-                    for tcp_stream in forwarder.incoming() {
-                        debug!("Got new non-TLS connection, forwarding...");
-                        match tcp_stream {
-                            Err(e) => {
-                                error!("Unable to open stream, got error {}", e);
-                                continue;
-                            }
-                            Ok(mut stream) => {
-                                Server::redirect_non_tls(stream, tls_port);
-                            }
+            let http_addr = format!("{}:{}", self.ip, self.http_port);
+            let forwarder = TcpListener::bind(http_addr).unwrap();
+            let routes = Arc::clone(&self.routes);
+            let tls_port = self.tls_port.clone();
+            self.thread_pool.execute(move || {
+                for tcp_stream in forwarder.incoming() {
+                    debug!("Got new non-TLS connection, forwarding...");
+                    match tcp_stream {
+                        Err(e) => {
+                            error!("Unable to open stream, got error {}", e);
+                            continue;
+                        }
+                        Ok(mut stream) => {
+                            Server::redirect_non_tls(stream, tls_port);
                         }
                     }
-                })
-            }
+                }
+            })
         }
             
         fn panic_on_tls_without_certificates(&self) {
