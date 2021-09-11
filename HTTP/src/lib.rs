@@ -497,9 +497,10 @@ pub mod HTTP {
         }
 
         fn start_http_redirection(&self) {
-            warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             // Spawn a thread that redirects all non-TLS traffic to the TLS address.
             let http_addr = format!("{}:{}", self.ip, self.http_port);
+            info!("Starting HTTP redirection at {}", http_addr);
+            warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             let forwarder = TcpListener::bind(http_addr).unwrap();
             let routes = Arc::clone(&self.routes);
             let tls_port = self.tls_port.clone();
