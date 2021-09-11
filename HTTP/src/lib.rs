@@ -244,8 +244,8 @@ pub mod HTTP {
                 }
             }
             result.extend(headers_str.into_bytes());
+            result.extend(b"\r\n");
             if let Some(body) = &self.body {
-                result.extend(b"\r\n");
                 result.extend(body);
             }
             result
