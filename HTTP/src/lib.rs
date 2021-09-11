@@ -473,12 +473,10 @@ pub mod HTTP {
                 error!("Something went wrong setting the stream read timeout: {}", e);
                 return;
             };
-            let request = Request::new();
             let mut response = bad_request_response();
 
             if let Ok(request) = Server::http_request_from_stream(&mut stream) {
                 // Read the host from the request and change HTTP to HTTPS.
-                let resp = bad_request_response();
                 if let Some(headers) = request.headers {
                     if let Some(host) = headers.get("Host") {
                         let host_no_port = match host.contains(':') {
@@ -493,6 +491,7 @@ pub mod HTTP {
                     }
                 }
             };
+            debug!("Redirecting with response: {}", response);
             Server::send_http_response_to_stream(stream, response);
         }
 
@@ -506,7 +505,7 @@ pub mod HTTP {
             let tls_port = self.tls_port.clone();
             self.thread_pool.execute(move || {
                 for tcp_stream in forwarder.incoming() {
-                    debug!("Got new non-TLS connection, forwarding...");
+                    debug!("Got new non-TLS connection, redirecting...");
                     match tcp_stream {
                         Err(e) => {
                             error!("Unable to open stream, got error {}", e);
