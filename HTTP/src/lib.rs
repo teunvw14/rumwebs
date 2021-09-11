@@ -20,7 +20,7 @@ pub mod HTTP {
     use std::io;
     
     use lazy_static::lazy_static;
-    use log::{error, info, debug, trace};
+    use log::{error, warn, info, debug, trace};
     use regex::Regex;
     use rustls;
     use rustls::internal::pemfile::*;
@@ -497,7 +497,7 @@ pub mod HTTP {
         }
 
         fn start_http_redirection(&self) {
-            !warn("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
+            warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             // Spawn a thread that redirects all non-TLS traffic to the TLS address.
             let http_addr = format!("{}:{}", self.ip, self.http_port);
             let forwarder = TcpListener::bind(http_addr).unwrap();
