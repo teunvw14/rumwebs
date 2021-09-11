@@ -468,7 +468,7 @@ pub mod HTTP {
             self.handle_connections();
         }
 
-        fn redirect_non_tls(mut stream: TcpStream, tls_port: usize) {
+        fn redirect_non_tls(mut stream: TcpStream) {
             if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
                 error!("Something went wrong setting the stream read timeout: {}", e);
                 return;
@@ -486,7 +486,7 @@ pub mod HTTP {
                             // before the colon) 
                             true => host.split(':').next().unwrap(),
                         };
-                        let https_host = format!("{}:{}", host_no_port, tls_port);
+                        let https_host = format!("https://{}", host_no_port);
                         response = moved_permanently_response(&https_host);
                     }
                 }
@@ -502,7 +502,6 @@ pub mod HTTP {
             warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             let forwarder = TcpListener::bind(http_addr).unwrap();
             let routes = Arc::clone(&self.routes);
-            let tls_port = self.tls_port.clone();
             self.thread_pool.execute(move || {
                 for tcp_stream in forwarder.incoming() {
                     debug!("Got new non-TLS connection, redirecting...");
@@ -512,7 +511,7 @@ pub mod HTTP {
                             continue;
                         }
                         Ok(mut stream) => {
-                            Server::redirect_non_tls(stream, tls_port);
+                            Server::redirect_non_tls(stream);
                         }
                     }
                 }
