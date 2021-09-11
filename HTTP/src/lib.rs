@@ -277,16 +277,20 @@ pub mod HTTP {
                 let bytes = fs::read(&path_owned);
                 match bytes {
                     Ok(bytes) => Response::new().with_body(&bytes).prepare_response(),
-                    // TODO: maybe panic here since the caller of this function
-                    // expects it to work if it returns.
                     Err(e) => {
-                        error!("Error opening path {}: {}", &path_owned, e);
-                        not_found_response()
+                        panic!("Can't create ResponseGenerator from file. Error opening path {}: {}", &path_owned, e);
                     }
                 }
             };
             ResponseGenerator::new(Box::new(func))
         }
+    }
+
+    fn moved_permanently_response(to: &str) -> Response {
+        Response::new()
+        .with_status(StatusCodes::MOVED_PERMANENTLY)
+        .with_header(("Location", to))
+        .prepare_response()
     }
 
     fn bad_request_response() -> Response {
@@ -454,7 +458,34 @@ pub mod HTTP {
             self.handle_connections();
         }
 
-        // TODO: clean this up please
+        fn redirect_non_tls(mut stream: TcpStream, tls_port: usize) {
+            if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+                error!("Something went wrong setting the stream read timeout: {}", e);
+                return;
+            };
+            let request = Request::new();
+            let mut response = bad_request_response();
+
+            if let Ok(request) = Server::http_request_from_stream(&mut stream) {
+                // Read the host from the request and change HTTP to HTTPS.
+                let resp = bad_request_response();
+                if let Some(headers) = request.headers {
+                    if let Some(host) = headers.get("Host") {
+                        let host_no_port = match host.contains(':') {
+                            false => host,
+                            // TODO: come up with a better default for the host 
+                            // (now this will return "" if there is nothing 
+                            // before the colon) 
+                            true => host.split(':').next().unwrap(),
+                        };
+                        let https_host = format!("{}:{}", host_no_port, tls_port);
+                        response = moved_permanently_response(&https_host);
+                    }
+                }
+            };
+            Server::send_http_response_to_stream(stream, response);
+        }
+
         fn start_http_redirection(&self) {
             // Spawn a thread that redirects all non-TLS traffic to the TLS address.
             if self.tls_enabled {
@@ -463,38 +494,15 @@ pub mod HTTP {
                 let routes = Arc::clone(&self.routes);
                 let tls_port = self.tls_port.clone();
                 self.thread_pool.execute(move || {
-                    for conn in forwarder.incoming() {
+                    for tcp_stream in forwarder.incoming() {
                         debug!("Got new non-TLS connection, forwarding...");
-                        match conn {
+                        match tcp_stream {
                             Err(e) => {
                                 error!("Unable to open stream, got error {}", e);
                                 continue;
                             }
                             Ok(mut stream) => {
-                                if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
-                                    error!("Something went wrong setting the stream read timeout: {}", e);
-                                };
-                                let request = Request::new();
-                                let mut response = bad_request_response();
-
-                                if let Ok(request) = Server::http_request_from_stream(&mut stream) {
-                                    // Read the host from the request and change HTTP to HTTPS.
-                                    let resp = bad_request_response();
-                                    if let Some(headers) = request.headers {
-                                        if let Some(host) = headers.get("Host") {
-                                            let host_no_port = match host.contains(':') {
-                                                false => host,
-                                                // TODO: come up with a better default for the host
-                                                true => host.split(':').next().unwrap_or(""),
-                                            };
-                                            let https_host = format!("{}:{}", host_no_port, tls_port);
-                                            response = Response::new()
-                                            .with_status(StatusCodes::MOVED_PERMANENTLY)
-                                            .with_header(("Location", &https_host));
-                                        }
-                                    }
-                                };
-                                Server::send_http_response_to_stream(stream, response);
+                                Server::redirect_non_tls(stream, tls_port);
                             }
                         }
                     }
@@ -520,74 +528,50 @@ pub mod HTTP {
             }
         }
 
-        fn handle_request_tls(&self, mut tcp_stream: TcpStream) {
-            trace!("Parsing HTTP request from stream...");
+        fn handle_request<T: io::Write + io::Read>(
+            mut stream: T,
+            running_path: &Path,
+            access_policy: &ServerAccessPolicy,
+            routes: Arc<HashMap<String, ResponseGenerator>>
+        ) {
+            let parsed_request = Server::http_request_from_stream(&mut stream);
+            let http_response = match parsed_request {
+                Ok(mut request) => {
+                    debug!(r#"New Request "{}""#, request);
+                    let unknown_route_handler;
+                    let generator = match routes.get(&request.uri) {
+                        Some(route_response) => route_response,
+                        None => {
+                            unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &access_policy, &running_path);
+                            &unknown_route_handler
+                        },
+                    };
+                    let response_fn = Arc::clone(&generator.0);
+                    response_fn(request)
+                }
+                Err(e) => {
+                    error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
+                    bad_request_response()
+                },
+            };
+            Server::send_http_response_to_stream(stream, http_response);
+        }
+
+        fn request_to_thread(&self, mut tcp_stream: TcpStream) {
             let server = Arc::clone(&self.tls_config.as_ref().unwrap());
             let running_path = self.running_path.clone();
             let access_policy = self.access_policy.clone();
             let routes = Arc::clone(&self.routes);
+            let tls_enabled = self.tls_enabled.clone();
 
             self.thread_pool.execute(move || {
-                let mut session = rustls::ServerSession::new(&server);
-                let mut stream = rustls::Stream::new(&mut session, &mut tcp_stream);
-                let parsed_request = Server::http_request_from_stream(&mut stream);
-                let mut request = Request::new();
-                let unknown_route_handler;
-                let response_generator = match parsed_request {
-                    Ok(req) => {
-                        // TODO: maybe remove this line (seems unnecessary)
-                        request = req;
-                        debug!(r#"New Request "{}""#, request);
-                        match routes.get(&request.uri) {
-                            Some(route_response) => route_response,
-                            None => {
-                                unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &access_policy, &running_path);
-                                &unknown_route_handler
-                            },
-                        }
-                    }
-                    Err(e) => {
-                        error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
-                        routes.get("/400").unwrap()
-                    },
-                };
-                let response_fn = Arc::clone(&response_generator.0);
-                let http_response = response_fn(request);
-                // let http_response = Response::new().with_status(StatusCodes::OK)
-                // .with_body(b"<!DOCTYPE html><html><body><h1>Hello world!</h1></body></html>")
-                // .prepare_response();
-                // trace!("Sending response: {}", http_response);
-                Server::send_http_response_to_stream(stream, http_response);
-            })
-        }
-
-        fn handle_request_no_tls(&self, mut tcp_stream: TcpStream) {
-            trace!("Parsing HTTP request from stream...");
-            let parsed_request = Server::http_request_from_stream(&mut tcp_stream);
-            let mut request = Request::new();
-            let unknown_route_handler;
-            let response_generator = match parsed_request {
-                Ok(req) => {
-                    // TODO: maybe remove this line (seems unnecessary)
-                    request = req;
-                    debug!(r#"New Request "{}""#, request);
-                    match self.routes.get(&request.uri) {
-                        Some(route_response) => route_response,
-                        None => {
-                            unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &self.access_policy, &self.running_path);
-                            &unknown_route_handler
-                        }
-                    }
+                if tls_enabled {
+                    let mut session = rustls::ServerSession::new(&server);
+                    let mut stream = rustls::Stream::new(&mut session, &mut tcp_stream);
+                    Server::handle_request(stream, &running_path, &access_policy, routes);
+                } else {
+                    Server::handle_request(tcp_stream, &running_path, &access_policy, routes);
                 }
-                Err(e) => {
-                    error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
-                    self.routes.get("/400").unwrap()
-                },
-            };
-            let response_fn = Arc::clone(&response_generator.0);
-            self.thread_pool.execute(move || {
-                let http_response = response_fn(request);
-                Server::send_http_response_to_stream(tcp_stream, http_response);
             })
         }
 
@@ -612,10 +596,7 @@ pub mod HTTP {
                         if let Err(e) = tcp_stream.set_write_timeout(Some(Duration::from_millis(500))) {
                             error!("Something went wrong setting the stream write timeout: {}", e);
                         }
-                        match self.tls_enabled {
-                            false => self.handle_request_no_tls(tcp_stream),
-                            true => self.handle_request_tls(tcp_stream),
-                        }
+                        self.request_to_thread(tcp_stream);
                     }
                 }
             }
@@ -633,7 +614,7 @@ pub mod HTTP {
             // we can extract the path to that file from env::current_dir. Then
             // we know that the file is contained within the running path if it
             // is contained within the path to the file that is being accessed.'
-            // TODO: make sure this solution is fast enough for a webserver.
+            // TODO: make sure this solution is fast enough for a webserver AND THAT IT'S SAFE!!!.
             if let Ok(_) = env::set_current_dir(buff) {
                 if let Ok(cur_dir) = env::current_dir() {
                     if let Some(cur_dir_str) = cur_dir.to_str() {
