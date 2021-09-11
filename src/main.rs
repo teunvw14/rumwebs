@@ -54,18 +54,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .clone()
         .into_str()?;
 
-    let port_str = match tls_enabled {
-        true => format!("{}", tls_port),
-        false => format!("{}", http_port),
-    };
-
     // Bind server to localhost:
     let mut server = HTTP::Server::builder()
         .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
+        .with_ip(&ip)
+        .with_http_port(http_port)
+        .with_tls_port(tls_port)
         .with_thread_count(thread_count)
         .add_route_to_file("/", "res/index.html")
         .add_route_to_file("/favicon", "res/favicon.png")
-        .bind(&format!("{}:{}", ip, port_str));
+        .bind();
 
     info!("Starting server with {} threads...", thread_count);
     server.start();

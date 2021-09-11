@@ -16,6 +16,11 @@ pub const OK: StatusCode = StatusCode {
     name: "OK",
 };
 
+pub const MOVED_PERMANENTLY: StatusCode = StatusCode {
+    code: 301,
+    name: "Moved Permanently",
+};
+
 pub const BAD_REQUEST: StatusCode = StatusCode {
     code: 400,
     name: "Bad Request",

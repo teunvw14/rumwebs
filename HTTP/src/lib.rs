@@ -343,24 +343,17 @@ pub mod HTTP {
             }
             self
         }
-
-        pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
-            // Drop thread pool to make sure all
-            // threads finish their tasks.
-            self.server.thread_pool.set_thread_count(count);
-            self
-        }
-
+        
         pub fn add_route(mut self, route: &str, f: Box<dyn Send + Sync + Fn(Request) -> Response>) -> ServerBuilder {
             self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::new(f));
             self
         }
-
+        
         pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder {
             self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::from_file(path));
             self
         }
-
+        
         pub fn add_routes(mut self, routes: HashMap<String, ResponseGenerator>) -> ServerBuilder {
             // Add (so not replace) server routes.
             for (route, response) in routes {
@@ -369,14 +362,40 @@ pub mod HTTP {
             self
         }
 
+        pub fn with_ip(mut self, ip: &str) -> ServerBuilder {
+            self.server.ip = ip.to_string();
+            self
+        }
+
+        pub fn with_http_port(mut self, port: usize) -> ServerBuilder {
+            self.server.http_port = port;
+            self
+        }
+
+        pub fn with_tls_port(mut self, port: usize) -> ServerBuilder {
+            self.server.tls_port = port;
+            self
+        }
+
+        pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
+            // Drop thread pool to make sure all
+            // threads finish their tasks.
+            self.server.thread_pool.set_thread_count(count);
+            self
+        }
+
         pub fn with_access_policy(mut self, policy: ServerAccessPolicy) -> ServerBuilder {
             self.server.access_policy = policy;
             self
         }
 
-        pub fn bind(mut self, addr: &str) -> Server {
-            self.server.bind_addr = String::from(addr);
-            self.server.listener = Some(TcpListener::bind(addr).unwrap());
+        pub fn bind(mut self) -> Server {
+            let port = match self.server.tls_enabled {
+                false => self.server.http_port,
+                true => self.server.tls_port,
+            };
+            self.server.bind_addr = format!("{}:{}", self.server.ip, port);
+            self.server.listener = Some(TcpListener::bind(&self.server.bind_addr).unwrap());
             // Route 400, 403 and 404 by default, as they are necessary for the
             // server to function. They can be overwritten.
             self
@@ -393,6 +412,9 @@ pub mod HTTP {
         unfinished_routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
         pub bind_addr: String,
+        ip: String,
+        http_port: usize,
+        tls_port: usize,
         pub tls_enabled: bool,
         listener: Option<TcpListener>,
         tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -408,6 +430,9 @@ pub mod HTTP {
                     unfinished_routes: HashMap::new(),
                     access_policy: ServerAccessPolicy::Restricted,
                     bind_addr: String::new(),
+                    ip: String::new(),
+                    http_port: 0,
+                    tls_port: 0,
                     tls_enabled: false,
                     listener: None,
                     tls_config: None,
@@ -420,6 +445,7 @@ pub mod HTTP {
             self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
             self.panic_on_missing_mandatory_routes();
+            self.start_http_redirection();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
@@ -428,6 +454,54 @@ pub mod HTTP {
             self.handle_connections();
         }
 
+        // TODO: clean this up please
+        fn start_http_redirection(&self) {
+            // Spawn a thread that redirects all non-TLS traffic to the TLS address.
+            if self.tls_enabled {
+                let http_addr = format!("{}:{}", self.ip, self.http_port);
+                let forwarder = TcpListener::bind(http_addr).unwrap();
+                let routes = Arc::clone(&self.routes);
+                let tls_port = self.tls_port.clone();
+                self.thread_pool.execute(move || {
+                    for conn in forwarder.incoming() {
+                        debug!("Got new non-TLS connection, forwarding...");
+                        match conn {
+                            Err(e) => {
+                                error!("Unable to open stream, got error {}", e);
+                                continue;
+                            }
+                            Ok(mut stream) => {
+                                if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+                                    error!("Something went wrong setting the stream read timeout: {}", e);
+                                };
+                                let request = Request::new();
+                                let mut response = bad_request_response();
+
+                                if let Ok(request) = Server::http_request_from_stream(&mut stream) {
+                                    // Read the host from the request and change HTTP to HTTPS.
+                                    let resp = bad_request_response();
+                                    if let Some(headers) = request.headers {
+                                        if let Some(host) = headers.get("Host") {
+                                            let host_no_port = match host.contains(':') {
+                                                false => host,
+                                                // TODO: come up with a better default for the host
+                                                true => host.split(':').next().unwrap_or(""),
+                                            };
+                                            let https_host = format!("{}:{}", host_no_port, tls_port);
+                                            response = Response::new()
+                                            .with_status(StatusCodes::MOVED_PERMANENTLY)
+                                            .with_header(("Location", &https_host));
+                                        }
+                                    }
+                                };
+                                Server::send_http_response_to_stream(stream, response);
+                            }
+                        }
+                    }
+                })
+            }
+        }
+            
         fn panic_on_tls_without_certificates(&self) {
             if self.tls_enabled && self.tls_config.is_none() {
                 panic!("TLS was enabled, but no certificates were supplied.");
@@ -521,7 +595,7 @@ pub mod HTTP {
             // Unwrap here because the server is expected to have a working
             // TcpListener set up when this function is called.
             for tcp_stream in self.listener.as_ref().unwrap().incoming() {
-                trace!("Got new incoming TCP stream.");
+                debug!("Got new incoming TCP stream.");
                 // If something went wrong dealing with the stream, we don't
                 // want to send back data, so we continue the loop to the next
                 // incoming connection.
@@ -531,7 +605,7 @@ pub mod HTTP {
                         continue;
                     }
                     Ok(tcp_stream) => {
-                        trace!("TCP stream incoming from {}.", tcp_stream.peer_addr().unwrap());
+                        debug!("TCP stream incoming from {}.", tcp_stream.peer_addr().unwrap());
                         if let Err(e) = tcp_stream.set_read_timeout(Some(Duration::from_millis(500))) {
                             error!("Something went wrong setting the stream read timeout: {}", e);
                         };
