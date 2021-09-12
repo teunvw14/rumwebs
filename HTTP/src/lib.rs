@@ -100,9 +100,10 @@ pub mod HTTP {
 
         pub fn from_bytes(bytes: &[u8]) -> Result<Request, HTTPError::InvalidRequest> {
             // Check if the bytes even form an HTTP request.
-            if !String::from_utf8_lossy(bytes).contains("HTTP/") {
+            let lossy_http = String::from_utf8_lossy(bytes);
+            if !lossy_http.contains("HTTP/") {
                 return Err(HTTPError::InvalidRequest::new(
-                    "Bytes don't form a valid HTTP request.",
+                    &format!("Unable to find request line in bytes {}", lossy_http)
                 ));
             }
 
@@ -271,14 +272,20 @@ pub mod HTTP {
             )
         }
         
-        pub fn from_file(path: &str) -> ResponseGenerator {
-            let path_owned = path.to_string();
+        pub fn from_file(path: PathBuf) -> ResponseGenerator {
+            // Make sure that the file is readable.
+            if let Err(e) = fs::File::open(&path) {
+                panic!("Can't create ResponseGenerator from file. Error opening path {}: {}", path.display(), e);
+            }
             let func = move |_req| {
-                let bytes = fs::read(&path_owned);
+                let bytes = fs::read(&path);
                 match bytes {
                     Ok(bytes) => Response::new().with_body(&bytes).prepare_response(),
                     Err(e) => {
-                        panic!("Can't create ResponseGenerator from file. Error opening path {}: {}", &path_owned, e);
+                        // If we get to this point, creation must have succeeded (since we panic
+                        // when we can't open the file). This means that something must have changed
+                        // about the file.
+                        panic!("Something went wrong opening route file {}. Problem is: {}", path.display(), e);
                     }
                 }
             };
@@ -353,7 +360,7 @@ pub mod HTTP {
             self
         }
         
-        pub fn add_route_to_file(mut self, route: &str, path: &str) -> ServerBuilder {
+        pub fn add_route_to_file(mut self, route: &str, path: PathBuf) -> ServerBuilder {
             self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::from_file(path));
             self
         }
@@ -646,11 +653,11 @@ pub mod HTTP {
             // Strip the leading "/" from the uri.
             let uri_stripped = &uri.to_string()[1..];
             match access_policy {
-                ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(uri_stripped),
+                ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(PathBuf::from(uri_stripped)),
                 ServerAccessPolicy::RestrictUp => {
                     if let Ok(requested_file) = PathBuf::from_str(uri_stripped) {
                         if Server::file_within_running_path(running_path, &requested_file) {
-                            return ResponseGenerator::from_file(requested_file.to_str().unwrap());
+                            return ResponseGenerator::from_file(requested_file);
                         } else {
                             debug!("Illegal file request, '{:?}' is not in running dir.", &requested_file);
                             return ResponseGenerator::new(Box::new(|_| { forbidden_response() }));

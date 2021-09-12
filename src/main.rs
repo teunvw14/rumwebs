@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 #[macro_use]
 extern crate log;
 extern crate simplelog;
@@ -64,12 +65,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_ip(&ip)
         .with_http_port(http_port)
         .with_tls_port(tls_port)
-        .with_access_policy(HTTP::ServerAccessPolicy::RestrictUp)
         .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
         .with_http_redirection(redirect_http)
         .with_thread_count(thread_count)
-        .add_route_to_file("/", "res/index.html")
-        .add_route_to_file("/favicon", "res/favicon.png")
+        .add_route_to_file("/", PathBuf::from("res/index.html"))
+        .add_route_to_file("/favicon", PathBuf::from("res/favicon.png"))
         .bind();
 
     info!("Starting server with {} threads...", thread_count);
