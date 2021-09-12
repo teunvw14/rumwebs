@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_ip(&ip)
         .with_http_port(http_port)
         .with_tls_port(tls_port)
+        .with_access_policy(HTTP::ServerAccessPolicy::RestrictUp)
         .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
         .with_http_redirection(redirect_http)
         .with_thread_count(thread_count)

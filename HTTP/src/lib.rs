@@ -566,7 +566,10 @@ pub mod HTTP {
         }
 
         fn request_to_thread(&self, mut tcp_stream: TcpStream) {
-            let server = Arc::clone(&self.tls_config.as_ref().unwrap());
+            let mut server = None;
+            if let Some(config) = &self.tls_config {
+                server = Some(Arc::clone(config))
+            };
             let running_path = self.running_path.clone();
             let access_policy = self.access_policy.clone();
             let routes = Arc::clone(&self.routes);
@@ -574,7 +577,8 @@ pub mod HTTP {
 
             self.thread_pool.execute(move || {
                 if tls_enabled {
-                    let mut session = rustls::ServerSession::new(&server);
+                    // Unwrap is safe here because server is always Some() with tls_enabled.
+                    let mut session = rustls::ServerSession::new(&server.unwrap());
                     let mut stream = rustls::Stream::new(&mut session, &mut tcp_stream);
                     Server::handle_request(stream, &running_path, &access_policy, routes);
                 } else {
