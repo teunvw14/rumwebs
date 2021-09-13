@@ -405,6 +405,20 @@ pub mod HTTP {
             self
         }
 
+        fn set_mandatory_routes(mut self) -> ServerBuilder {
+            // Use self = self.add_route(...) to get back ownership after calling add_route.
+            if !self.server.routes.contains_key("/400") {
+                self = self.add_route("/400", Box::new(|_req| bad_request_response()));
+            }
+            if !self.server.routes.contains_key("/403") {
+                self = self.add_route("/403", Box::new(|_req| forbidden_response()));
+            }
+            if !self.server.routes.contains_key("/404") {
+                self = self.add_route("/404", Box::new(|_req| not_found_response()));
+            }
+            self
+        }
+
         pub fn bind(mut self) -> Server {
             let port = match self.server.tls_enabled {
                 false => self.server.http_port,
@@ -414,10 +428,7 @@ pub mod HTTP {
             self.server.listener = Some(TcpListener::bind(&self.server.bind_addr).unwrap());
             // Route 400, 403 and 404 by default, as they are necessary for the
             // server to function. They can be overwritten.
-            self
-            .add_route("/400", Box::new(|_req| bad_request_response()))
-            .add_route("/403", Box::new(|_req| forbidden_response()))
-            .add_route("/404",Box::new(|_req| not_found_response()))
+            self.set_mandatory_routes()
             .server
         }
     }
@@ -462,7 +473,6 @@ pub mod HTTP {
         pub fn start(&mut self) {
             self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
-            self.panic_on_missing_mandatory_routes();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
@@ -528,18 +538,6 @@ pub mod HTTP {
         fn panic_on_tls_without_certificates(&self) {
             if self.tls_enabled && self.tls_config.is_none() {
                 panic!("TLS was enabled, but no certificates were supplied.");
-            }
-        }
-
-        fn panic_on_missing_mandatory_routes(&self) {
-            if !self.routes.contains_key("/400") {
-                panic!("Failed to start server. Missing route '/400', which is core to the functionality of the server.");
-            }
-            if !self.routes.contains_key("/403") {
-                panic!("Failed to start server. Missing route '/403', which is core to the functionality of the server.");
-            }
-            if !self.routes.contains_key("/404") {
-                panic!("Failed to start server. Missing route '/404', which is core to the functionality of the server.");
             }
         }
 
