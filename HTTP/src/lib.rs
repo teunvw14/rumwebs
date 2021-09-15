@@ -4,15 +4,12 @@ pub mod HTTP {
     pub mod RequestMethods;
     pub mod StatusCodes;
 
-    use std::error::Error;
     use std::net::{ TcpListener, TcpStream };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::io::prelude::*;
     use std::io::BufReader;
     use std::time::Duration;
     use std::str::FromStr;
-    use std::sync::Mutex;
     use std::sync::Arc;
     use std::fmt;
     use std::env;
@@ -272,10 +269,12 @@ pub mod HTTP {
             )
         }
         
-        pub fn from_file(path: PathBuf) -> ResponseGenerator {
-            // Make sure that the file is readable.
-            if let Err(e) = fs::File::open(&path) {
-                panic!("Can't create ResponseGenerator from file. Error opening path {}: {}", path.display(), e);
+        pub fn from_file(path: PathBuf, panic_on_err: bool) -> ResponseGenerator {
+            if panic_on_err {
+                // Make sure that the file exists and is readable.
+                if let Err(e) = fs::File::open(&path) {
+                    panic!("Unable to open file {}, got error: `{}`", &path.display(), e);
+                }
             }
             let func = move |_req| {
                 let bytes = fs::read(&path);
@@ -285,7 +284,8 @@ pub mod HTTP {
                         // If we get to this point, creation must have succeeded (since we panic
                         // when we can't open the file). This means that something must have changed
                         // about the file.
-                        panic!("Something went wrong opening route file {}. Problem is: {}", path.display(), e);
+                        error!("Something went wrong opening route file {}. Problem is: {}", path.display(), e);
+                        not_found_response()
                     }
                 }
             };
@@ -349,7 +349,8 @@ pub mod HTTP {
                 let key_der = keys.pop().unwrap();
                 // Build the config with the opened certificates:
                 let mut config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-                config.set_single_cert(cert_chain, key_der);
+                // Unwrap so that this fails if the certificates are invalid.
+                config.set_single_cert(cert_chain, key_der).expect("Invalid certificates.");
                 self.server.tls_config = Some(Arc::new(config));
             }
             self
@@ -361,7 +362,7 @@ pub mod HTTP {
         }
         
         pub fn add_route_to_file(mut self, route: &str, path: PathBuf) -> ServerBuilder {
-            self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::from_file(path));
+            self.server.unfinished_routes.insert(route.to_string(), ResponseGenerator::from_file(path, true));
             self
         }
         
@@ -518,7 +519,6 @@ pub mod HTTP {
             info!("Starting HTTP redirection at {}", http_addr);
             warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
             let forwarder = TcpListener::bind(http_addr).unwrap();
-            let routes = Arc::clone(&self.routes);
             self.thread_pool.execute(move || {
                 for tcp_stream in forwarder.incoming() {
                     debug!("Got new non-TLS connection, redirecting...");
@@ -527,7 +527,7 @@ pub mod HTTP {
                             error!("Unable to open stream, got error {}", e);
                             continue;
                         }
-                        Ok(mut stream) => {
+                        Ok(stream) => {
                             Server::redirect_non_tls(stream);
                         }
                     }
@@ -549,7 +549,7 @@ pub mod HTTP {
         ) {
             let parsed_request = Server::http_request_from_stream(&mut stream);
             let http_response = match parsed_request {
-                Ok(mut request) => {
+                Ok(request) => {
                     debug!(r#"New Request "{}""#, request);
                     let unknown_route_handler;
                     let generator = match routes.get(&request.uri) {
@@ -584,7 +584,7 @@ pub mod HTTP {
                 if tls_enabled {
                     // Unwrap is safe here because server is always Some() with tls_enabled.
                     let mut session = rustls::ServerSession::new(&server.unwrap());
-                    let mut stream = rustls::Stream::new(&mut session, &mut tcp_stream);
+                    let stream = rustls::Stream::new(&mut session, &mut tcp_stream);
                     Server::handle_request(stream, &running_path, &access_policy, routes);
                 } else {
                     Server::handle_request(tcp_stream, &running_path, &access_policy, routes);
@@ -651,11 +651,11 @@ pub mod HTTP {
             // Strip the leading "/" from the uri.
             let uri_stripped = &uri.to_string()[1..];
             match access_policy {
-                ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(PathBuf::from(uri_stripped)),
+                ServerAccessPolicy::AllowAll => ResponseGenerator::from_file(PathBuf::from(uri_stripped), false),
                 ServerAccessPolicy::RestrictUp => {
                     if let Ok(requested_file) = PathBuf::from_str(uri_stripped) {
                         if Server::file_within_running_path(running_path, &requested_file) {
-                            return ResponseGenerator::from_file(requested_file);
+                            return ResponseGenerator::from_file(requested_file, false);
                         } else {
                             debug!("Illegal file request, '{:?}' is not in running dir.", &requested_file);
                             return ResponseGenerator::new(Box::new(|_| { forbidden_response() }));
