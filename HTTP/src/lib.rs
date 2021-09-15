@@ -627,22 +627,16 @@ pub mod HTTP {
             if buff.iter().next() == None {
                 result = true;
             }
-            // Change the directory to the requested file's directory, so that
-            // we can extract the path to that file from env::current_dir. Then
-            // we know that the file is contained within the running path if it
-            // is contained within the path to the file that is being accessed.'
-            // TODO: make sure this solution is fast enough for a webserver AND THAT IT'S SAFE!!!.
-            if let Ok(_) = env::set_current_dir(buff) {
-                if let Ok(cur_dir) = env::current_dir() {
-                    if let Some(cur_dir_str) = cur_dir.to_str() {
-                        if let Some(running_path_str) = running_path.to_str() {
-                            if cur_dir_str.contains(running_path_str) {
-                                result = true;
-                            }
-                        }
+            // Canonicalize paths and check if the requested file path starts with
+            // the running path, i.e. the requested file is within the running path.
+            if let Ok(file_canonical_path) = requested_file.canonicalize() {
+                if let Ok(running_path_canonical) = running_path.canonicalize() {
+                    if file_canonical_path.starts_with(running_path_canonical) {
+                        result = true;
                     }
                 }
             }
+
             env::set_current_dir(running_path).unwrap();
             result
         }
