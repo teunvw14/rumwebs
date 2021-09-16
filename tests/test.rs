@@ -22,5 +22,5 @@ fn format_http_response() {
 fn format_http_response_without_body() {
     let status = HTTP::StatusCodes::OK;
     let resp = HTTP::Response::new().with_status(status);
-    assert_eq!(format!("{}", resp), "HTTP/1.1 200 OK\r\n");
+    assert_eq!(format!("{}", resp), "HTTP/1.1 200 OK\r\n\r\n");
 }
