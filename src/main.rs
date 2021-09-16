@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
+use std::str::FromStr;
+
 #[macro_use]
 extern crate log;
 extern crate simplelog;
@@ -11,10 +13,9 @@ use simplelog::*;
 extern crate rumwebs_http;
 use rumwebs_http::HTTP;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logging:
-    SimpleLogger::init(LevelFilter::Debug, Config::default()).expect("Unable to set up logger.");
 
+fn main() -> Result<(), Box<dyn Error>> {
+    // Load settings
     let mut settings = config::Config::default();
     settings
         .merge(config::File::with_name("Config.toml"))
@@ -26,6 +27,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .clone()
         .into_int()? as usize;
+    let log_level = settings_application
+        .get("log_level")
+        .unwrap()
+        .clone()
+        .into_str()?;
 
     let settings_server = settings.get_table("server")?;
     let ip = settings_server.get("ip").unwrap().clone().into_str()?;
@@ -64,6 +70,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .clone()
         .into_str()?;
+
+    // Initialize logging:
+    SimpleLogger::init(
+        LevelFilter::from_str(&log_level).unwrap(),
+        Config::default(),
+    )
+    .expect("Unable to set up logger.");
 
     // Bind server to localhost:
     let mut server = HTTP::Server::builder()

@@ -4,7 +4,7 @@ pub mod HTTP {
     pub mod RequestMethods;
     pub mod StatusCodes;
 
-    use std::net::{ TcpListener, TcpStream };
+    use std::net::{TcpListener, TcpStream};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::io::BufReader;
@@ -16,6 +16,7 @@ pub mod HTTP {
     use std::fs;
     use std::io;
     
+    use chrono::prelude::*;
     use lazy_static::lazy_static;
     use log::{error, warn, info, debug, trace};
     use regex::Regex;
@@ -78,6 +79,7 @@ pub mod HTTP {
     }
 
     pub struct Request {
+        pub request_line: String,
         pub method: RequestMethod,
         pub uri: String,
         pub http_version: String,
@@ -88,6 +90,7 @@ pub mod HTTP {
     impl Request {
         pub fn new() -> Request {
             Request {
+                request_line: String::new(),
                 method: RequestMethod::GET,
                 uri: "/".to_string(),
                 http_version: "1.1".to_string(),
@@ -133,18 +136,17 @@ pub mod HTTP {
             };
             let crlf = "\r\n";
             let mut head_split_crlf = head_str.split(crlf);
-            let first_line = head_split_crlf.next()
+            let request_line = head_split_crlf.next()
             .ok_or_else(|| HTTPError::InvalidRequest::new(
                 "Unable to get first line from head/body split."
             ))?;
-
             // Use lazy_static to only compile this Regex once.
             lazy_static! {
                 // Unwrap is safe because this fails only if the regex pattern is incorrect.
                 static ref RE: Regex = Regex::new(r"^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH) (/.*?) (HTTP/\d\.\d)$").unwrap();
             }
 
-            match RE.captures(first_line) {
+            match RE.captures(request_line) {
                 Some(caps) => {
                     let method_str = caps.get(1)
                     .ok_or_else(|| HTTPError::InvalidRequest::new(
@@ -171,7 +173,9 @@ pub mod HTTP {
                         ))?.to_string();
                         headers.insert(k, v);
                     }
+                    let owned_request_line = request_line.to_string();
                     Ok(Request {
+                        request_line: owned_request_line,
                         method,
                         uri,
                         http_version,
@@ -181,7 +185,7 @@ pub mod HTTP {
                     }
                 None => {
                     return Err(HTTPError::InvalidRequest::new(
-                        &format!("Something is not right with this request line. {}", first_line),
+                        &format!("Something is not right with this request line. {}", request_line),
                     ))
                 }
             }
@@ -231,6 +235,13 @@ pub mod HTTP {
         pub fn with_headers(mut self, headers: HashMap<String, String>) -> Response {
             self.headers = Some(headers);
             self
+        }
+
+        pub fn get_header_value(&self, header: &str) -> Option<&String> {
+            match &self.headers {
+                Some(headers) => headers.get(header),
+                None => None,
+            }
         }
 
         pub fn with_body(mut self, body: &[u8]) -> Response {
@@ -539,7 +550,6 @@ pub mod HTTP {
                     }
                 }
             };
-            debug!("Redirecting with response: {}", response);
             Server::send_http_response_to_stream(stream, response);
         }
 
@@ -579,7 +589,9 @@ pub mod HTTP {
             running_path: &Path,
             access_policy: &ServerAccessPolicy,
             routes: Arc<HashMap<String, ResponseGenerator>>
-        ) {
+        ) -> (String, StatusCodes::StatusCode, String) {
+            let mut request_line = String::new();
+
             let parsed_request = Server::http_request_from_stream(&mut stream);
             let http_response = match parsed_request {
                 Ok(request) => {
@@ -593,6 +605,7 @@ pub mod HTTP {
                         },
                     };
                     let response_fn = Arc::clone(&generator.0);
+                    request_line = String::from(&request.request_line);
                     response_fn(request)
                 }
                 Err(e) => {
@@ -600,7 +613,12 @@ pub mod HTTP {
                     bad_request_response()
                 },
             };
+            let default_body_size_string = String::from("0");
+            let response_size = http_response.get_header_value("Content-Length")
+            .unwrap_or(&default_body_size_string).to_string();
+            let response_code = http_response.status.clone();
             Server::send_http_response_to_stream(stream, http_response);
+            (request_line, response_code, response_size)
         }
 
         fn request_to_thread(&self, mut tcp_stream: TcpStream) {
@@ -614,14 +632,24 @@ pub mod HTTP {
             let tls_enabled = self.tls_enabled.clone();
 
             self.thread_pool.execute(move || {
-                if tls_enabled {
+                // Do some work that is needed for logging later.
+                let peer_ip = match tcp_stream.peer_addr() {
+                    Ok(ipaddr) => ipaddr.to_string(),
+                    Err(e) => String::from("*unkown*"),
+                };
+                let (request_line, response_code, response_size) =  if tls_enabled {
                     // Unwrap is safe here because server is always Some() with tls_enabled.
                     let mut session = rustls::ServerSession::new(&server_config.unwrap());
                     let stream = rustls::Stream::new(&mut session, &mut tcp_stream);
-                    Server::handle_request(stream, &running_path, &access_policy, routes);
+                    Server::handle_request(stream, &running_path, &access_policy, routes)
                 } else {
-                    Server::handle_request(tcp_stream, &running_path, &access_policy, routes);
-                }
+                    Server::handle_request(tcp_stream, &running_path, &access_policy, routes)
+                };
+                
+                // Output log according to "Common Log Format", see https://en.wikipedia.org/wiki/Common_Log_Format
+                let time: DateTime<Local> = Local::now();
+                info!(r#"{} - - [{}] "{}" {} {}"#, 
+                peer_ip, time.format("%d/%b/%Y:%H:%M:%S %z"), request_line, response_code, response_size);
             })
         }
 

@@ -11,3 +11,4 @@ default_host = "localhost"
 
 [application]
 thread_count = 8
+log_level = "INFO"

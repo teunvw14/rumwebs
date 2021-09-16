@@ -252,6 +252,7 @@ dependencies = [
 name = "rumwebs-http"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lazy_static",
  "log",
  "regex",

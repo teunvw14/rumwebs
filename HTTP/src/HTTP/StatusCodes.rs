@@ -1,5 +1,6 @@
 use std::fmt;
 
+#[derive(Clone)]
 pub struct StatusCode {
     code: usize,
     name: &'static str,
