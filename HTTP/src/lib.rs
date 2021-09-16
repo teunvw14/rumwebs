@@ -24,6 +24,7 @@ pub mod HTTP {
 
     use rumwebs_threadpool::ThreadPool;
 
+
     #[derive(Eq, PartialEq)]
     pub enum RequestMethod {
         GET,
@@ -122,7 +123,6 @@ pub mod HTTP {
                 head = bytes.to_vec();
                 body = None;
             };
-
             let head_str = match String::from_utf8(head) {
                 Ok(h) => h,
                 Err(_) => {
@@ -133,23 +133,42 @@ pub mod HTTP {
             };
             let crlf = "\r\n";
             let mut head_split_crlf = head_str.split(crlf);
-            let first_line = head_split_crlf.next().unwrap();
+            let first_line = head_split_crlf.next()
+            .ok_or_else(|| HTTPError::InvalidRequest::new(
+                "Unable to get first line from head/body split."
+            ))?;
 
             // Use lazy_static to only compile this Regex once.
             lazy_static! {
+                // Unwrap is safe because this fails only if the regex pattern is incorrect.
                 static ref RE: Regex = Regex::new(r"^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH) (/.*?) (HTTP/\d\.\d)$").unwrap();
             }
 
             match RE.captures(first_line) {
                 Some(caps) => {
-                    let method_str = caps.get(1).unwrap().as_str();
+                    let method_str = caps.get(1)
+                    .ok_or_else(|| HTTPError::InvalidRequest::new(
+                        "Failed getting `method_str` from request line."
+                    ))?.as_str();
                     let method = RequestMethod::from_str(method_str)?;
-                    let uri = String::from(caps.get(2).unwrap().as_str());
-                    let http_version = String::from(caps.get(3).unwrap().as_str());
+                    let uri = String::from(caps.get(2)
+                    .ok_or_else(|| HTTPError::InvalidRequest::new(
+                        "Failed getting `uri` from request line."
+                    ))?.as_str());
+                    let http_version = String::from(caps.get(3)
+                    .ok_or_else(|| HTTPError::InvalidRequest::new(
+                        "Failed getting `http_version` from request line."
+                    ))?.as_str());
                     let mut headers = HashMap::new();
                     for header in head_split_crlf {
-                        let k = header.split(": ").nth(0).unwrap().to_string();
-                        let v = header.split(": ").nth(1).unwrap().to_string();
+                        let k = header.split(": ").nth(0)
+                        .ok_or_else(|| HTTPError::InvalidRequest::new(
+                        &format!("Couldn't get header key from header line {}", &header)
+                        ))?.to_string();
+                        let v = header.split(": ").nth(1)
+                        .ok_or_else(|| HTTPError::InvalidRequest::new(
+                        &format!("Couldn't get header value from header line {}", &header)
+                        ))?.to_string();
                         headers.insert(k, v);
                     }
                     Ok(Request {
@@ -341,15 +360,17 @@ pub mod HTTP {
             if tls_enabled {
                 let mut cert_file = BufReader::new(fs::File::open(fullchain_path)
                 .expect(&format!("Unable to open certificate fullchain path '{}'.", fullchain_path)));
+                // `expect` because inability to load certificate is a fatal error.
                 let cert_chain = certs(&mut cert_file).unwrap();
                 let mut key_file = BufReader::new(fs::File::open(privkey_path)
                 .expect(&format!("Unable to open certificate privkey path '{}'.", fullchain_path)));
+                // Again: `expect` because inability to load certificate is a fatal error.
                 let mut keys = pkcs8_private_keys(&mut key_file).unwrap();
                 // Should be only one key so we can pop from the keys vector.
-                let key_der = keys.pop().unwrap();
+                let key_der = keys.pop().expect("Can't get key from certificate key file.");
                 // Build the config with the opened certificates:
                 let mut config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-                // Unwrap so that this fails if the certificates are invalid.
+                // `expect` so that this fails if the certificates are invalid.
                 config.set_single_cert(cert_chain, key_der).expect("Invalid certificates.");
                 self.server.tls_config = Some(Arc::new(config));
             }
@@ -406,6 +427,11 @@ pub mod HTTP {
             self
         }
 
+        pub fn set_default_host(mut self, default_host: &str) -> ServerBuilder {
+            self.server.default_host = String::from(default_host);
+            self
+        }
+
         fn set_mandatory_routes(mut self) -> ServerBuilder {
             // Use self = self.add_route(...) to get back ownership after calling add_route.
             if !self.server.routes.contains_key("/400") {
@@ -426,7 +452,10 @@ pub mod HTTP {
                 true => self.server.tls_port,
             };
             self.server.bind_addr = format!("{}:{}", self.server.ip, port);
-            self.server.listener = Some(TcpListener::bind(&self.server.bind_addr).unwrap());
+            // expect (i.e. unwrap) because inability to bind TcpListener is a fatal
+            let bind_addr = &self.server.bind_addr;
+            self.server.listener = Some(TcpListener::bind(bind_addr)
+            .expect(&format!("Problem binding TcpListener to server bind_addr {}", bind_addr)));
             // Route 400, 403 and 404 by default, as they are necessary for the
             // server to function. They can be overwritten.
             self.set_mandatory_routes()
@@ -448,6 +477,7 @@ pub mod HTTP {
         listener: Option<TcpListener>,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         running_path: PathBuf,
+        default_host: String,
     }
 
     impl Server {
@@ -467,6 +497,7 @@ pub mod HTTP {
                     listener: None,
                     tls_config: None,
                     running_path: PathBuf::new(),
+                    default_host: String::new(),
                 }
             }
         }
@@ -486,13 +517,12 @@ pub mod HTTP {
             self.handle_connections();
         }
 
-        fn redirect_non_tls(mut stream: TcpStream) {
+        fn redirect_non_tls(mut stream: TcpStream, default_host: &str) {
             if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
                 error!("Something went wrong setting the stream read timeout: {}", e);
                 return;
             };
             let mut response = bad_request_response();
-
             if let Ok(request) = Server::http_request_from_stream(&mut stream) {
                 // Read the host from the request and change HTTP to HTTPS.
                 if let Some(headers) = request.headers {
@@ -502,7 +532,7 @@ pub mod HTTP {
                             // TODO: come up with a better default for the host 
                             // (now this will return "" if there is nothing 
                             // before the colon) 
-                            true => host.split(':').next().unwrap(),
+                            true => host.split(':').next().unwrap_or(default_host),
                         };
                         let https_host = format!("https://{}", host_no_port);
                         response = moved_permanently_response(&https_host);
@@ -518,7 +548,10 @@ pub mod HTTP {
             let http_addr = format!("{}:{}", self.ip, self.http_port);
             info!("Starting HTTP redirection at {}", http_addr);
             warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
-            let forwarder = TcpListener::bind(http_addr).unwrap();
+            // `expect` here because inability to bind the TcpListener is a fatal error
+            let forwarder = TcpListener::bind(&http_addr)
+            .expect(&format!("Problem binding TcpListener to {} http redirection.", &http_addr));
+            let default_host = self.default_host.clone();
             self.thread_pool.execute(move || {
                 for tcp_stream in forwarder.incoming() {
                     debug!("Got new non-TLS connection, redirecting...");
@@ -528,7 +561,7 @@ pub mod HTTP {
                             continue;
                         }
                         Ok(stream) => {
-                            Server::redirect_non_tls(stream);
+                            Server::redirect_non_tls(stream, &default_host);
                         }
                     }
                 }
@@ -571,9 +604,9 @@ pub mod HTTP {
         }
 
         fn request_to_thread(&self, mut tcp_stream: TcpStream) {
-            let mut server = None;
+            let mut server_config = None;
             if let Some(config) = &self.tls_config {
-                server = Some(Arc::clone(config))
+                server_config = Some(Arc::clone(config))
             };
             let running_path = self.running_path.clone();
             let access_policy = self.access_policy.clone();
@@ -583,7 +616,7 @@ pub mod HTTP {
             self.thread_pool.execute(move || {
                 if tls_enabled {
                     // Unwrap is safe here because server is always Some() with tls_enabled.
-                    let mut session = rustls::ServerSession::new(&server.unwrap());
+                    let mut session = rustls::ServerSession::new(&server_config.unwrap());
                     let stream = rustls::Stream::new(&mut session, &mut tcp_stream);
                     Server::handle_request(stream, &running_path, &access_policy, routes);
                 } else {
@@ -606,7 +639,6 @@ pub mod HTTP {
                         continue;
                     }
                     Ok(tcp_stream) => {
-                        debug!("TCP stream incoming from {}.", tcp_stream.peer_addr().unwrap());
                         if let Err(e) = tcp_stream.set_read_timeout(Some(Duration::from_millis(500))) {
                             error!("Something went wrong setting the stream read timeout: {}", e);
                         };
@@ -636,8 +668,6 @@ pub mod HTTP {
                     }
                 }
             }
-
-            env::set_current_dir(running_path).unwrap();
             result
         }
 

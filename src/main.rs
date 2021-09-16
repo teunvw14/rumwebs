@@ -13,7 +13,7 @@ use rumwebs_http::HTTP;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logging:
-    SimpleLogger::init(LevelFilter::Debug, Config::default()).unwrap();
+    SimpleLogger::init(LevelFilter::Debug, Config::default()).expect("Unable to set up logger.");
 
     let mut settings = config::Config::default();
     settings
@@ -59,6 +59,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .clone()
         .into_str()?;
+    let default_host = settings_server
+        .get("default_host")
+        .unwrap()
+        .clone()
+        .into_str()?;
 
     // Bind server to localhost:
     let mut server = HTTP::Server::builder()
@@ -66,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_http_port(http_port)
         .with_tls_port(tls_port)
         .set_tls(tls_enabled, &tls_cert_fullchain, &tls_cert_privkey)
+        .set_default_host(&default_host)
         .with_http_redirection(redirect_http)
         .with_thread_count(thread_count)
         .add_route_to_file("/", PathBuf::from("res/index.html"))
