@@ -13,7 +13,6 @@ use simplelog::*;
 extern crate rumwebs_http;
 use rumwebs_http::HTTP;
 
-
 fn main() -> Result<(), Box<dyn Error>> {
     // Load settings
     let mut settings = config::Config::default();
@@ -32,6 +31,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .clone()
         .into_str()?;
+    let conn_per_thread = settings_application
+        .get("conn_per_thread")
+        .unwrap()
+        .clone()
+        .into_int()? as usize;
 
     let settings_server = settings.get_table("server")?;
     let ip = settings_server.get("ip").unwrap().clone().into_str()?;

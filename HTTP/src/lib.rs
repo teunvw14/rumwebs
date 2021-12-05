@@ -1,16 +1,17 @@
-extern crate rumwebs_threadpool;
+extern crate rumwebs_tcp_thread_pool;
 pub mod HTTP {
     pub mod HTTPError;
     pub mod RequestMethods;
     pub mod StatusCodes;
 
-    use std::net::{TcpListener, TcpStream};
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::io::BufReader;
     use std::time::Duration;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::thread;
     use std::fmt;
     use std::env;
     use std::fs;
@@ -22,9 +23,14 @@ pub mod HTTP {
     use regex::Regex;
     use rustls;
     use rustls::internal::pemfile::*;
+    use mio;
+    use mio::{Poll, Events, Token, Interest};
+    use mio::net::{TcpListener, TcpStream};
 
-    use rumwebs_threadpool::ThreadPool;
+    use rumwebs_tcp_thread_pool::TcpThreadPool;
+    use rumwebs_tcp_thread_pool::{Job, WorkerMessage};
 
+    const SERVER_JOB_ID: usize = 1;
 
     #[derive(Eq, PartialEq)]
     pub enum RequestMethod {
@@ -421,10 +427,18 @@ pub mod HTTP {
             self
         }
 
-        pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
-            // Drop thread pool to make sure all
-            // threads finish their tasks.
-            self.server.thread_pool.set_thread_count(count);
+        // TODO: maybe reinstante this function later
+        // pub fn with_thread_count(mut self, count: usize) -> ServerBuilder {
+        //     // Drop thread pool to make sure all
+        //     // threads finish their tasks.
+        //     if let Some(pool) = &mut self.server.thread_pool {
+        //         pool.set_thread_count(count);
+        //     }
+        //     self
+        // }
+
+        pub fn set_conn_per_thread(mut self, conn_per_thread: usize) -> ServerBuilder {
+            self.server.conn_per_thread = conn_per_thread;
             self
         }
 
@@ -464,7 +478,8 @@ pub mod HTTP {
             };
             self.server.bind_addr = format!("{}:{}", self.server.ip, port);
             // expect (i.e. unwrap) because inability to bind TcpListener is a fatal
-            let bind_addr = &self.server.bind_addr;
+            let bind_addr = SocketAddr::from_str(&self.server.bind_addr)
+            .expect(&format!("Can't parse ip address: {}", &self.server.bind_addr));
             self.server.listener = Some(TcpListener::bind(bind_addr)
             .expect(&format!("Problem binding TcpListener to server bind_addr {}", bind_addr)));
             // Route 400, 403 and 404 by default, as they are necessary for the
@@ -475,7 +490,10 @@ pub mod HTTP {
     }
 
     pub struct Server {
-        pub thread_pool: ThreadPool,
+        // TODO: see if this Option can be removed cause it's ugly man.
+        pub thread_pool: Option<TcpThreadPool>,
+        thread_count: usize,
+        conn_per_thread: usize,
         pub routes: Arc<HashMap<String, ResponseGenerator>>,
         unfinished_routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
@@ -493,9 +511,12 @@ pub mod HTTP {
 
     impl Server {
         pub fn builder() -> ServerBuilder {
+            let empty_job: Job = Arc::new(|_, _| {});
             ServerBuilder {
                 server: Server {
-                    thread_pool: ThreadPool::new(1),
+                    thread_pool: None,
+                    conn_per_thread: 1,
+                    thread_count: 1,
                     routes: Arc::new(HashMap::new()),
                     unfinished_routes: HashMap::new(),
                     access_policy: ServerAccessPolicy::Restricted,
@@ -513,6 +534,48 @@ pub mod HTTP {
             }
         }
 
+        pub fn server_job(&self) -> Job {
+            return Arc::new({                
+                let running_path = self.running_path.clone();
+                let access_policy = self.access_policy.clone();
+                let routes = Arc::clone(&self.routes);
+                let tls_enabled = self.tls_enabled.clone();
+                // The actual job:
+                move |bytes_in: &[u8], write_buff: &mut Vec<u8>| {
+                    println!("Doing job");
+                    // let mut request_line = String::new();
+                    println!("flag 1");
+                    let parsed_request = Request::from_bytes(bytes_in);
+                    println!("flag 2");
+                    let http_response = match parsed_request {
+                        Ok(request) => {
+                            debug!(r#"New Request "{}""#, request);
+                            let unknown_route_handler;
+                            let generator = match routes.get(&request.uri) {
+                                Some(route_response) => route_response,
+                                None => {
+                                    unknown_route_handler = Server::get_unknown_route_handler(&request.uri, &access_policy, &running_path);
+                                    &unknown_route_handler
+                                },
+                            };
+                            let response_fn = Arc::clone(&generator.0);
+                            // request_line = String::from(&request.request_line);
+                            response_fn(request)
+                        }
+                        Err(e) => {
+                            error!("Got invalid HTTP request, sending back HTTP 400. Problem was: {}", e);
+                            bad_request_response()
+                        },
+                    };
+                    let default_body_size_string = String::from("0");
+                    let response_size = http_response.get_header_value("Content-Length")
+                    .unwrap_or(&default_body_size_string).to_string();
+                    let response_code = http_response.status.clone();
+                    *write_buff = http_response.message_bytes();
+                }
+            })
+        }
+
         pub fn start(&mut self) {
             self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
@@ -520,19 +583,21 @@ pub mod HTTP {
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
             if self.tls_enabled && self.redirect_http {
-                info!("Starting HTTP redirection.");
-                self.start_http_redirection();
+                info!("HTTP redirection currently under maintenance.");
+                // self.start_http_redirection();
             }
             info!("Running path set to: {:?}", self.running_path);
             info!("Now serving at {}", self.bind_addr);
+            self.thread_pool = Some(TcpThreadPool::new(self.thread_count, 1024, 1024, 2048));
+            self.thread_pool.unwrap().assign_new_job(SERVER_JOB_ID, self.server_job(), self.thread_count);
             self.handle_connections();
         }
 
         fn redirect_non_tls(mut stream: TcpStream, default_host: &str) {
-            if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
-                error!("Something went wrong setting the stream read timeout: {}", e);
-                return;
-            };
+            // if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+            //     error!("Something went wrong setting the stream read timeout: {}", e);
+            //     return;
+            // };
             let mut response = bad_request_response();
             if let Ok(request) = Server::http_request_from_stream(&mut stream) {
                 // Read the host from the request and change HTTP to HTTPS.
@@ -553,30 +618,30 @@ pub mod HTTP {
             Server::send_http_response_to_stream(stream, response);
         }
 
-        fn start_http_redirection(&self) {
-            // Spawn a thread that redirects all non-TLS traffic to the TLS address.
-            let http_addr = format!("{}:{}", self.ip, self.http_port);
-            info!("Starting HTTP redirection at {}", http_addr);
-            warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
-            // `expect` here because inability to bind the TcpListener is a fatal error
-            let forwarder = TcpListener::bind(&http_addr)
-            .expect(&format!("Problem binding TcpListener to {} http redirection.", &http_addr));
-            let default_host = self.default_host.clone();
-            self.thread_pool.execute(move || {
-                for tcp_stream in forwarder.incoming() {
-                    debug!("Got new non-TLS connection, redirecting...");
-                    match tcp_stream {
-                        Err(e) => {
-                            error!("Unable to open stream, got error {}", e);
-                            continue;
-                        }
-                        Ok(stream) => {
-                            Server::redirect_non_tls(stream, &default_host);
-                        }
-                    }
-                }
-            })
-        }
+        // fn start_http_redirection(&self) {
+        //     // Spawn a thread that redirects all non-TLS traffic to the TLS address.
+        //     let http_addr = format!("{}:{}", self.ip, self.http_port);
+        //     info!("Starting HTTP redirection at {}", http_addr);
+        //     // warn!("HTTP redirection will take up one of the server's thread pool's workers. Performance might be reduced.");
+        //     // `expect` here because inability to bind the TcpListener is a fatal error
+        //     let forwarder = TcpListener::bind(&http_addr)
+        //     .expect(&format!("Problem binding TcpListener to {} http redirection.", &http_addr));
+        //     let default_host = self.default_host.clone();
+        //     thread::spawn(move || {
+        //         for tcp_stream in forwarder.incoming() {
+        //             debug!("Got new non-TLS connection, redirecting...");
+        //             match tcp_stream {
+        //                 Err(e) => {
+        //                     error!("Unable to open stream, got error {}", e);
+        //                     continue;
+        //                 }
+        //                 Ok(stream) => {
+        //                     Server::redirect_non_tls(stream, &default_host);
+        //                 }
+        //             }
+        //         }
+        //     });
+        // }
             
         fn panic_on_tls_without_certificates(&self) {
             if self.tls_enabled && self.tls_config.is_none() {
@@ -621,60 +686,91 @@ pub mod HTTP {
             (request_line, response_code, response_size)
         }
 
+        fn connection_to_thread(&self, mut tcp_stream: TcpStream) {
+            let msg = WorkerMessage::NewConnection(tcp_stream);
+            println!("sending connection to thread");
+            self.thread_pool.as_ref().unwrap().sender.send(msg);
+        }
+
         fn request_to_thread(&self, mut tcp_stream: TcpStream) {
             let mut server_config = None;
             if let Some(config) = &self.tls_config {
                 server_config = Some(Arc::clone(config))
             };
+            
             let running_path = self.running_path.clone();
             let access_policy = self.access_policy.clone();
             let routes = Arc::clone(&self.routes);
             let tls_enabled = self.tls_enabled.clone();
 
-            self.thread_pool.execute(move || {
-                // Do some work that is needed for logging later.
-                let peer_ip = match tcp_stream.peer_addr() {
-                    Ok(ipaddr) => ipaddr.to_string(),
-                    Err(e) => String::from("*unkown*"),
-                };
-                let (request_line, response_code, response_size) =  if tls_enabled {
-                    // Unwrap is safe here because server is always Some() with tls_enabled.
-                    let mut session = rustls::ServerSession::new(&server_config.unwrap());
-                    let stream = rustls::Stream::new(&mut session, &mut tcp_stream);
-                    Server::handle_request(stream, &running_path, &access_policy, routes)
-                } else {
-                    Server::handle_request(tcp_stream, &running_path, &access_policy, routes)
-                };
+            // self.thread_pool.execute(move || {
+            //     // Do some work that is needed for logging later.
+            //     let peer_ip = match tcp_stream.peer_addr() {
+            //         Ok(ipaddr) => ipaddr.to_string(),
+            //         Err(e) => String::from("*unkown*"),
+            //     };
+            //     let (request_line, response_code, response_size) =  if tls_enabled {
+            //         // Unwrap is safe here because server is always Some() with tls_enabled.
+            //         let mut session = rustls::ServerSession::new(&server_config.unwrap());
+            //         let stream = rustls::Stream::new(&mut session, &mut tcp_stream);
+            //         Server::handle_request(stream, &running_path, &access_policy, routes)
+            //     } else {
+            //         Server::handle_request(tcp_stream, &running_path, &access_policy, routes)
+            //     };
                 
-                // Output log according to "Common Log Format", see https://en.wikipedia.org/wiki/Common_Log_Format
-                let time: DateTime<Local> = Local::now();
-                info!(r#"{} - - [{}] "{}" {} {}"#, 
-                peer_ip, time.format("%d/%b/%Y:%H:%M:%S %z"), request_line, response_code, response_size);
-            })
+            //     // Output log according to "Common Log Format", see https://en.wikipedia.org/wiki/Common_Log_Format
+            //     let time: DateTime<Local> = Local::now();
+            //         info!(r#"{} - - [{}] "{}" {} {}"#, 
+            //     peer_ip, time.format("%d/%b/%Y:%H:%M:%S %z"), request_line, response_code, response_size);
+            // })
         }
 
-        fn handle_connections(&self) {
+        fn handle_connections(&mut self) -> ! {            
+            let mut poll = Poll::new().unwrap();
+            let mut events = Events::with_capacity(2048);
+
+            // Register the socket with `Poll`
+            poll.registry().register(self.listener.as_mut().unwrap(), Token(0), Interest::READABLE).unwrap();
+
             // Unwrap here because the server is expected to have a working
             // TcpListener set up when this function is called.
-            for tcp_stream in self.listener.as_ref().unwrap().incoming() {
-                debug!("Got new incoming TCP stream.");
-                // If something went wrong dealing with the stream, we don't
-                // want to send back data, so we continue the loop to the next
-                // incoming connection.
-                match tcp_stream {
-                    Err(e) => {
-                        error!("Unable to open stream, got error {}", e);
-                        continue;
-                    }
-                    Ok(tcp_stream) => {
-                        if let Err(e) = tcp_stream.set_read_timeout(Some(Duration::from_millis(500))) {
-                            error!("Something went wrong setting the stream read timeout: {}", e);
-                        };
-                        if let Err(e) = tcp_stream.set_write_timeout(Some(Duration::from_millis(500))) {
-                            error!("Something went wrong setting the stream write timeout: {}", e);
+            loop {
+                print!("p");
+                poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
+                for event in &events {
+                    println!("Got some event.");
+                    if event.is_readable() && event.token() == Token(0) {
+                        loop {
+                            // If something went wrong dealing with the stream, we don't
+                            // want to send back data, so we continue the loop to the next
+                            // incoming connection.
+                            match self.listener.as_mut().unwrap().accept() {
+                                Err(e) => {
+                                    if e.kind() == io::ErrorKind::WouldBlock {
+                                        println!("would block to accept another conn");
+                                        break;
+                                    }
+                                    else {
+                                        error!("Unable to open stream, got error {}", e);
+                                        continue;
+                                    }
+                                }
+                                Ok((tcp_stream, remote_addr)) => {
+                                    println!("Got new tcp stream");
+                                    // TODO: maybe re-enable timeouts later
+                                    // if let Err(e) = tcp_stream.set_read_timeout(Some(Duration::from_millis(500))) {
+                                        //     error!("Something went wrong setting the stream read timeout: {}", e);
+                                        // };
+                                        // if let Err(e) = tcp_stream.set_write_timeout(Some(Duration::from_millis(500))) {
+                                            //     error!("Something went wrong setting the stream write timeout: {}", e);
+                                            // }
+                                    self.connection_to_thread(tcp_stream);
+                                }
+                            }
                         }
-                        self.request_to_thread(tcp_stream);
+                        println!("out of acceptance loop");
                     }
+                    println!("done processing event.");
                 }
             }
         }

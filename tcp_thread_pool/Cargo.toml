@@ -1,5 +1,5 @@
 [package]
-name = "rumwebs-threadpool"
+name = "rumwebs-tcp-thread-pool"
 version = "0.1.0"
 edition = "2018"
 
@@ -7,3 +7,4 @@ edition = "2018"
 
 [dependencies]
 log = "0.4.14"
+mio = { version = "0.7.13", features = ["net", "os-poll"] }

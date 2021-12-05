@@ -10,5 +10,6 @@ tls_cert_privkey = ""
 default_host = "localhost"
 
 [application]
-thread_count = 8
-log_level = "INFO"
+thread_count = 1
+conn_per_thread = 256
+log_level = "DEBUG"
