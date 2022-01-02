@@ -11,6 +11,6 @@ lazy_static = "1.4.0"
 log = "0.4.14"
 regex = "1.5.4"
 rustls = "0.19.1"
-mio = { version = "0.7.13", features = ["net", "os-poll"] }
+mio = { version = "0.8.0", features = ["net", "os-poll"] }
 
 rumwebs-tcp-thread-pool = { path = "../tcp_thread_pool", version = "0.1.0" }

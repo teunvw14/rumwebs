@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_thread_count(thread_count)
         .add_route_to_file("/", PathBuf::from("res/index.html"))
         .add_route_to_file("/favicon", PathBuf::from("res/favicon.png"))
+        .add_route_to_file("/img", PathBuf::from("res/smile.png"))
         .bind();
 
     info!("Starting server with {} threads...", thread_count);
