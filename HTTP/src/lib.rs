@@ -434,7 +434,7 @@ pub mod HTTP {
         }
 
         pub fn with_tls_port(mut self, port: usize) -> ServerBuilder {
-            self.server.tls_port = port;
+            self.server.https_port = port;
             self
         }
 
@@ -484,16 +484,6 @@ pub mod HTTP {
         }
 
         pub fn bind(mut self) -> Server {
-            let port = match self.server.tls_enabled {
-                false => self.server.http_port,
-                true => self.server.tls_port,
-            };
-            self.server.bind_addr = format!("{}:{}", self.server.ip, port);
-            // expect (i.e. unwrap) because inability to bind TcpListener is a fatal
-            let bind_addr = SocketAddr::from_str(&self.server.bind_addr)
-            .expect(&format!("Can't parse ip address: {}", &self.server.bind_addr));
-            self.server.listener = Some(TcpListener::bind(bind_addr)
-            .expect(&format!("Problem binding TcpListener to server bind_addr {}", bind_addr)));
             // Route 400, 403 and 404 by default, as they are necessary for the
             // server to function. They can be overwritten.
             self.set_mandatory_routes()
@@ -504,18 +494,17 @@ pub mod HTTP {
     pub struct Server {
         // TODO: see if this Option can be removed cause it's ugly man.
         pub thread_pool: TcpThreadPool,
+        connections: HashMap<Token, TcpStream>,
         thread_count: usize,
         conn_per_thread: usize,
         pub routes: Arc<HashMap<String, ResponseGenerator>>,
         unfinished_routes: HashMap<String, ResponseGenerator>,
         pub access_policy: ServerAccessPolicy,
-        pub bind_addr: String,
         ip: String,
         http_port: usize,
-        tls_port: usize,
+        https_port: usize,
         pub tls_enabled: bool,
         redirect_http: bool,
-        listener: Option<TcpListener>,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         running_path: PathBuf,
         default_host: String,
@@ -527,18 +516,17 @@ pub mod HTTP {
             ServerBuilder {
                 server: Server {
                     thread_pool: TcpThreadPool::default(),
+                    connections: HashMap::new(),
                     conn_per_thread: 1,
                     thread_count: 1,
                     routes: Arc::new(HashMap::new()),
                     unfinished_routes: HashMap::new(),
                     access_policy: ServerAccessPolicy::Restricted,
-                    bind_addr: String::new(),
                     ip: String::new(),
                     http_port: 0,
-                    tls_port: 0,
+                    https_port: 0,
                     tls_enabled: false,
                     redirect_http: false,
-                    listener: None,
                     tls_config: None,
                     running_path: PathBuf::new(),
                     default_host: String::new(),
@@ -585,24 +573,35 @@ pub mod HTTP {
             })
         }
 
-        pub fn start(&mut self) {
+        pub fn start(&mut self) -> ! {
             self.routes = Arc::new(self.unfinished_routes.clone());
             self.panic_on_tls_without_certificates();
             // Set the running path and panic if the current dir cannot
             // be gotten from the system.
             self.running_path = env::current_dir().unwrap();
+            info!("Running path set to: {:?}", self.running_path);
             if self.tls_enabled && self.redirect_http {
                 info!("HTTP redirection currently under maintenance.");
                 // self.start_http_redirection();
             }
-            info!("Running path set to: {:?}", self.running_path);
-            info!("Now serving at {}", self.bind_addr);
+            
+            let port = match self.tls_enabled {
+                false => self.http_port,
+                true => self.https_port,
+            };
+            
             // Initialize the thread pool and set the server job to run.
             // TODO: fix these magic numbers
-            self.thread_pool = TcpThreadPool::new(self.thread_count, 1024, 4096, 4096);
+            self.thread_pool = TcpThreadPool::new(
+                self.thread_count,
+                1024,
+                4096,
+                4096
+            );
             let job = self.server_job();
-            self.thread_pool.assign_new_job(SERVER_JOB_ID, job, self.thread_count);
-            self.handle_connections();
+            self.thread_pool.assign_new_job(job, &self.ip, port, self.thread_count);
+            info!("Now serving at {}:{}", self.ip, port);
+            self.thread_pool.start();
         }
 
 
@@ -663,54 +662,11 @@ pub mod HTTP {
             }
         }
 
-        fn connection_to_thread_pool(&self, tcp_stream: TcpStream) {
-            self.thread_pool.new_stream_for_job(SERVER_JOB_ID, tcp_stream);
-        }
+        // fn connection_to_thread_pool(&self, token: Token, tcp_stream: TcpStream) {
+        //     self.thread_pool.new_connection_for_job(SERVER_JOB_ID, token, tcp_stream);
+        // }
 
-        fn handle_connections(&mut self) -> ! {            
-            let mut poll = Poll::new().unwrap();
-            let mut events = Events::with_capacity(4096);
 
-            let tcp_listener_token = Token(usize::MAX);
-            // Register the socket with `Poll`
-            poll.registry().register(self.listener.as_mut().unwrap(), tcp_listener_token, Interest::READABLE).unwrap();
-
-            // Unwrap here because the server is expected to have a working
-            // TcpListener set up when this function is called.
-            loop {
-                poll.poll(&mut events, None).unwrap();
-                debug!("Got some events for TCP listener, processing one by one.");
-                for event in &events {
-                    if event.is_readable() && event.token() == tcp_listener_token {
-                        loop {
-                            // If something went wrong dealing with the stream, we don't
-                            // want to send back data, so we continue the loop to the next
-                            // incoming connection.
-                            match self.listener.as_mut().unwrap().accept() {
-                                Ok((tcp_stream, _remote_addr)) => {
-                                    // TODO: maybe re-enable timeouts later
-                                    debug!("Got new valid tcp stream, sending to thread pool.");
-                                    self.connection_to_thread_pool(tcp_stream);
-                                    debug!("Successfully accepted new TCP stream.");
-                                }
-                                Err(e) => {
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        //debug!("---------------");
-                                        //debug!("Would block to accept new connection, waiting for new readiness event.");
-                                        // Wait until another readiness event is received.
-                                        break;
-                                    }
-                                    else {
-                                        error!("Unable to open stream, got error {}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         fn file_within_running_path(running_path: &Path, requested_file: &Path) -> bool {
             let mut result = false;

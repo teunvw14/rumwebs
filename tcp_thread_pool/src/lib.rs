@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::default;
 use std::error;
+use std::error::Error;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::io;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 use std::net::Shutdown;
@@ -15,15 +19,23 @@ use std::net::Shutdown;
 use log::{error, warn, info, debug, trace};
 use mio;
 use mio::Interest;
+use mio::Poll;
+use mio::event::Event;
 use mio::{Events,Token};
+use mio::net::{TcpListener, TcpStream};
 
 pub enum WorkerMessage {
-    NewConnection(mio::net::TcpStream),
+    NewConnection(Token, mio::net::TcpStream),
     Shutdown,
 }
 
+pub enum InfoMessage {
+    ReceivedConnection(usize, Token),
+    DeleteConnection(Token, TcpStream),
+}
+
 struct TcpConnection {
-    pub stream: mio::net::TcpStream,
+    stream: mio::net::TcpStream,
     ready_to_write: bool,
     ready_to_read: bool,
     read_buffer: Vec<u8>,
@@ -50,7 +62,9 @@ struct TcpWorker {
 impl TcpWorker {
     pub fn new(
         id: usize,
-        receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
+        message_receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
+        event_receiver: mpsc::Receiver<Event>,
+        info_sender: mpsc::Sender<InfoMessage>,
         job: Job,
         max_connections: usize,
         connection_read_buffer_size: usize,
@@ -63,28 +77,78 @@ impl TcpWorker {
         let thread = thread::spawn(move || {
             let mut connections = HashMap::new();
             info!("Started worker with id {}.", id);
-            // Failing to create a poll is a fatal error, thus unwrap.
-            let mut poll = mio::Poll::new()
-            .expect(&format!("Something went wrong creating the poll in thread {}.", id));
-            // TODO: see if we can remove this magic number
-            let mut events = Events::with_capacity(1024);
             loop {
                 // Shut down the worker if this returns false.
                 if !TcpWorker::register_new_message(
-                    &receiver,
+                    &message_receiver,
+                    &info_sender,
                     &mut connections,
                     max_connections,
                     connection_read_buffer_size,
                     connection_write_buffer_size,
-                    &poll,
                     id) {
                     break;
                 };
+                TcpWorker::process_events(&mut connections, &event_receiver, &info_sender, &job);
                 // info!("Registered new connection in thread {}.", id);
                 thread::sleep(Duration::from_millis(1));
-                // Wait at most 1 millisecond to check for new incoming connections
-                poll.poll(&mut events, None).unwrap();
-                for event in &events {
+            }
+        });
+        worker.thread = Some(thread);
+        worker
+    }
+
+    /// Register a new message for processing. Returns false if the worker
+    /// should shut down.
+    fn register_new_message(
+        message_receiver: &Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
+        info_sender: &mpsc::Sender<InfoMessage>,
+        connections: &mut HashMap<Token, TcpConnection>,
+        max_connections: usize,
+        connection_read_buffer_size: usize,
+        connection_write_buffer_size: usize,
+        id: usize,
+        // TODO: use result instead of bool here
+    ) -> bool {
+        // Discard messages that cannot be handled.
+        // TODO: make sure this doesn't break stuff. (it probably does)
+        if connections.len() >= max_connections {
+            warn!("Not adding connection, already at max_connections.");
+            return true;
+        }
+        else {
+            // TODO: make this recv_timeout instead of regular recv 
+            let message = message_receiver.lock().unwrap().recv().unwrap();
+            match message {
+                WorkerMessage::NewConnection(token, stream) => {
+                    let tcp_connection = TcpConnection::new(stream, connection_read_buffer_size, connection_write_buffer_size);
+                    connections.insert(token, tcp_connection);
+                    // TODO: remove the unwrap
+                    info_sender.send(InfoMessage::ReceivedConnection(id, token)).unwrap();
+                    // DON'T REMOVE THE BELOW LINE: THE PROGRAM DOESN'T WORK WITHOUT IT!
+                    info!("Registered new connection in thread {}.", id);
+                    return true;
+                }
+                WorkerMessage::Shutdown => {
+                    debug!(
+                        "Worker {} received shutdown message, terminating thread.",
+                        id
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    
+    fn process_events(
+        connections: &mut HashMap<Token, TcpConnection>,
+        event_receiver: &mpsc::Receiver<Event>,
+        info_sender: &mpsc::Sender<InfoMessage>,
+        job: &Job) {
+        loop {
+            // TODO: remove "magic number"
+            match event_receiver.recv_timeout(Duration::from_micros(10)) {
+                Ok(event) => {
                     let conn_token = event.token();
                     let connection = connections.get_mut(&conn_token).unwrap();
                     let mut delete_conn = false;
@@ -147,74 +211,19 @@ impl TcpWorker {
                     }
                     if delete_conn {
                         // TODO: properly handle these unwraps
-                        debug!("[Worker {}] Ending connection {:?}.", id, conn_token);
-                        connection.stream.shutdown(Shutdown::Write).unwrap();
-                        poll.registry().deregister(&mut connection.stream).unwrap();
-                        connections.remove(&conn_token);
+                        debug!("Ending connection {:?}.", conn_token);
+                        // connection.stream.shutdown(Shutdown::Write).unwrap();
+                        if let Some(conn) = connections.remove(&conn_token) {
+                            info_sender.send(InfoMessage::DeleteConnection(conn_token, conn.stream)).unwrap();
+                        }
                     }
                 }
-            }
-        });
-        worker.thread = Some(thread);
-        worker
-    }
-
-    fn get_unique_connection_token(open_connections : &HashMap<mio::Token, TcpConnection>) -> mio::Token {
-        let mut i: usize = 0;
-        while open_connections.contains_key(&Token(i)) {
-            i += 1;
-        }
-        return Token(i);
-    }
-
-
-    /// Register a new message for processing. Returns false if the worker
-    /// should shut down.
-    fn register_new_message(
-        receiver: &Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
-        connections: &mut HashMap<Token, TcpConnection>,
-        max_connections: usize,
-        connection_read_buffer_size: usize,
-        connection_write_buffer_size: usize,
-        poll: &mio::Poll,
-        id: usize,
-        // TODO: use result instead of bool here
-    ) -> bool {
-        // Discard messages that cannot be handled.
-        // TODO: make sure this doesn't break stuff.
-        if connections.len() >= max_connections {
-            info!("Not adding connection, already at max_connections.");
-            return true;
-        }
-        else {
-            // TODO: remove the unwrap
-            let message = receiver.lock().unwrap().recv().unwrap();
-            match message {
-                WorkerMessage::NewConnection(mut stream) => {
-                    let token = TcpWorker::get_unique_connection_token(&connections);
-                    // TODO: remove unwrap here
-                    poll.registry().register(
-                        &mut stream,
-                        token,
-                        Interest::READABLE | Interest::WRITABLE
-                    ).unwrap();
-                    let tcp_connection = TcpConnection::new(stream, connection_read_buffer_size, connection_write_buffer_size);
-                    connections.insert(token, tcp_connection);
-                    // DON'T REMOVE THE BELOW LINE: THE PROGRAM DOESN'T WORK WITHOUT IT!
-                    // info!("Registered new connection in thread {}.", id);
-                    return true;
-                }
-                WorkerMessage::Shutdown => {
-                    debug!(
-                        "Worker {} received shutdown message, terminating thread.",
-                        id
-                    );
-                    return false;
+                Err(e) => {
+                    break;
                 }
             }
         }
     }
-    
 }
 
 pub type Job = Arc<dyn Fn(&[u8], &mut Vec<u8>) + Send + Sync + 'static>;
@@ -224,25 +233,54 @@ pub type Job = Arc<dyn Fn(&[u8], &mut Vec<u8>) + Send + Sync + 'static>;
 /// threads.
 struct JobManager {
     job: Job,
-    sender: mpsc::Sender<WorkerMessage>,
-    receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
     assigned_workers: usize,
+    // This maps a connection (identified by Tokens) to the responsible
+    // worker (identified by a usize).
+    connections_worker_map: HashMap<Token, usize>,
+    worker_message_sender: mpsc::Sender<WorkerMessage>,
+    worker_message_receiver: Arc<Mutex<mpsc::Receiver<WorkerMessage>>>,
+    // Map from id (of the worker) to the Event sender for that worker
+    worker_event_senders: HashMap<usize, mpsc::Sender<Event>>,
+    worker_info_sender: mpsc::Sender<InfoMessage>,
+    worker_info_receiver: mpsc::Receiver<InfoMessage>,
 }
 
-#[derive(Default)]
 pub struct TcpThreadPool {
     thread_count: usize,
     workers: Vec<TcpWorker>,
-    job_list: HashMap<usize, JobManager>,
+    // `TcpListener`s are identified by mio Tokens
+    tcp_listeners: HashMap<Token, TcpListener>,
+    job_list: HashMap<Token, JobManager>,
+    // The open `TcpStream`s managed by the thread pool
+    connection_worker_map: HashMap<Token, usize>,
     max_connections_per_thread: usize,
     connection_read_buf_size: usize,
     connection_write_buf_size: usize,
+    poll: Poll,
+}
+
+impl Default for TcpThreadPool {
+    fn default() -> Self {
+        return TcpThreadPool {
+            thread_count: 1,
+            workers: Vec::new(),
+            // `TcpListener`s are identified by mio Tokens
+            tcp_listeners: HashMap::new(),
+            job_list: HashMap::new(),
+            // The open `TcpStream`s managed by the thread pool
+            connection_worker_map: HashMap::new(),
+            max_connections_per_thread: 0,
+            connection_read_buf_size: 0,
+            connection_write_buf_size: 0,
+            poll: Poll::new().unwrap(),
+        }
+    }
 }
 
 impl TcpThreadPool {
     /// Creates a ThreadPool with `thread_count` threads.
     ///
-    /// # Panics
+    /// ## Panics
     ///
     /// This will panic if the thread count is zero.
     pub fn new(
@@ -251,65 +289,207 @@ impl TcpThreadPool {
             connection_read_buf_size: usize,
             connection_write_buf_size: usize
         ) -> TcpThreadPool {
+
         assert_ne!(thread_count, 0);
-
+        
         let workers = Vec::with_capacity(thread_count);
-
         TcpThreadPool {
             thread_count,
             workers,
+            tcp_listeners: HashMap::new(),
             job_list: HashMap::new(),
+            connection_worker_map: HashMap::new(),
             max_connections_per_thread,
             connection_read_buf_size,
             connection_write_buf_size,
+            poll: Poll::new().unwrap(),
         }
     }
 
-    pub fn add_job(&mut self, id: usize, job: Job){
-        let (sender, receiver) = mpsc::channel();
-        // Wrap the receiver with an Arc<Mutex()> for sharing across threads.
-        let receiver = Arc::new(Mutex::new(receiver));
-        let job_distributor = JobManager {
-            job,
-            sender,
-            receiver,
-            assigned_workers: 0,
-        };
-        self.job_list.insert(id, job_distributor);
+    fn get_unique_poll_token(&self) -> Token {
+        let mut i: usize = 1;
+        while self.tcp_listeners.contains_key(&Token(i)) || 
+            self.connection_worker_map.contains_key(&Token(i)) {
+            i += 1;
+        }
+        return Token(i-1);
+    }
+
+    pub fn create_job(&mut self, job: Job, ip: &str, port: usize) -> Result<Token, ()> {
+        let bind_address = format!("{}:{}", ip, port);
+        match SocketAddr::from_str(&bind_address) {
+            Err(e) => {
+                error!("Can't parse IP address {}: {}", bind_address, e);
+                return Err(());
+            }
+            Ok(bind_address) => {
+                match TcpListener::bind(bind_address) {
+                    Err(e) => {
+                        error!("There was a problem binding a job to address {}: {}", bind_address, e);
+                        return Err(());
+                    },
+                    Ok(mut tcp_listener) => { 
+                        let (worker_message_sender, worker_message_receiver) = mpsc::channel();
+                        let (worker_info_sender, worker_info_receiver) = mpsc::channel();
+                        // Wrap the receiver with an Arc<Mutex()> for sharing across threads.
+                        let worker_message_receiver = Arc::new(Mutex::new(worker_message_receiver));                
+                        let job_manager = JobManager {
+                            job,
+                            assigned_workers: 0,
+                            connections_worker_map: HashMap::new(),
+                            worker_message_sender,
+                            worker_message_receiver,
+                            worker_event_senders: HashMap::new(),
+                            worker_info_receiver,
+                            worker_info_sender,
+                        };
+                        let token = self.get_unique_poll_token();
+                        self.job_list.insert(token, job_manager);
+                        //  TODO: remove unwrap
+                        self.poll.registry().register(&mut tcp_listener, token, Interest::READABLE).unwrap();
+                        self.tcp_listeners.insert(token, tcp_listener);
+                        debug!("Created new job for token {:?}", token);
+                        return Ok(token);
+                    }
+                }
+            }
+        }
     }
 
     /// Assign a new job to the thread pool for a certain amount of workers.
-    pub fn assign_new_job(&mut self, id: usize, job: Job, worker_count: usize) {
+    pub fn assign_new_job(&mut self, job: Job, ip: &str, port: usize, worker_count: usize) {
         // Add the job and get the newly created receiver to clone for the
         // workers:
-        self.add_job(id, job);
-        let job_distributor = self.job_list.get_mut(&id).unwrap();
-        for _ in 0..worker_count {
-            if self.workers.len() >= self.thread_count {
-                error!("Unable to assign {} workers to job because all {} workers already busy.", worker_count, self.thread_count);
-                break;
+        match self.create_job(job, ip, port) {
+            Err(_) => {
+                error!("Failed to assign new job.");
             }
-            let receiver = Arc::clone(&job_distributor.receiver);
-            let job = Arc::clone(&job_distributor.job);
-            self.workers.push(TcpWorker::new(
-                self.workers.len() + 1,
-                receiver,
-                job,
-                self.max_connections_per_thread,
-                self.connection_read_buf_size,
-                self.connection_write_buf_size,
-            ));
-            job_distributor.assigned_workers += 1;
+            Ok(token) => {
+                let job_manager = self.job_list.get_mut(&token).unwrap();
+                for _ in 0..worker_count {
+                    if self.workers.len() >= self.thread_count {
+                        error!("Unable to assign {} workers to job because all {} workers already busy.", worker_count, self.thread_count);
+                        break;
+                    }
+                    let connection_receiver = Arc::clone(&job_manager.worker_message_receiver);
+                    let (event_sender, event_receiver) = mpsc::channel();
+                    let worker_info_sender = job_manager.worker_info_sender.clone();
+
+                    let id = self.workers.len() + 1;
+                    job_manager.worker_event_senders.insert(id, event_sender);
+                    let job = Arc::clone(&job_manager.job);
+                    self.workers.push(TcpWorker::new(
+                        id,
+                        connection_receiver,
+                        event_receiver,
+                        worker_info_sender,
+                        job,
+                        self.max_connections_per_thread,
+                        self.connection_read_buf_size,
+                        self.connection_write_buf_size,
+                    ));
+                    job_manager.assigned_workers += 1;
+                }
+                debug!("Successfully assigned {} workers new job.", worker_count);
+            }
         }
     }
 
-    pub fn new_stream_for_job(&self, job_id: usize, stream: mio::net::TcpStream) {
-        if let Some(job_manager) = self.job_list.get(&job_id) {
-            let stream_message = WorkerMessage::NewConnection(stream);
+    pub fn new_connection_for_job(&self, token: Token, stream: mio::net::TcpStream) {
+        if let Some(job_manager) = self.job_list.get(&token) {
+            let stream_message = WorkerMessage::NewConnection(token,stream);
             // TODO: proper error handling
-            job_manager.sender.send(stream_message).unwrap();
+            job_manager.worker_message_sender.send(stream_message).unwrap();
         } else {
-            error!("Couldn't send job to TcpThreadPool workers because job with id {} doesn't exist.", job_id);
+            error!("Unable to send connection to worker because there's no job for token {:?}.", token);
+            error!("Available job tokens are: {:?}", self.job_list.keys());
+        }
+    }
+
+    fn process_event_listener(&self, event: &Event, listener: &TcpListener) {
+        if event.is_readable() {
+            loop {
+                // If something went wrong dealing with the stream, we don't
+                // want to send back data, so we continue the loop to the next
+                // incoming connection.
+                match listener.accept() {
+                    Ok((mut tcp_stream, _remote_addr)) => {
+                        // TODO: maybe re-enable timeouts later
+                        debug!("Got new valid tcp stream, sending to thread pool.");
+                        let token = self.get_unique_poll_token();
+                        // TODO: remove unwrap
+                        self.poll.registry().register(&mut tcp_stream, token, Interest::READABLE | Interest::WRITABLE).unwrap();
+                        self.new_connection_for_job(token, tcp_stream);
+                        debug!("Successfully accepted new TCP stream.");
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::WouldBlock {
+                            //debug!("---------------");
+                            //debug!("Would block to accept new connection, waiting for new readiness event.");
+                            // Wait until another readiness event is received.
+                            break;
+                        }
+                        else {
+                            error!("Unable to open stream, got error {}", e);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_event(&self, event: &Event) {
+        let token = event.token();
+        // We receive an event for a particular connection (represented)
+        // by a token, so we send it to the responsible worker.
+        if let Some(listener) = self.tcp_listeners.get(&token) {
+            debug!("Got new connection for TcpLisener.");
+            self.process_event_listener(event, listener);
+        }
+        if let Some(worker_id) = self.connection_worker_map.get(&token) {
+            debug!("[Worker {}] Got new event for connection {:?}.", worker_id, token);
+            let job_manager = self.job_list.get(&token).unwrap();
+            let sender = job_manager.worker_event_senders.get(worker_id).unwrap();
+            sender.send(event.to_owned()).unwrap();
+        }
+    }
+
+    fn process_job_worker_info(&mut self) {
+        for (_token, job_manager) in &self.job_list {
+            loop {
+                // TODO: remove magic number
+                match job_manager.worker_info_receiver.recv_timeout(Duration::from_micros(1)) {
+                    Ok(InfoMessage::ReceivedConnection(id, token)) => {
+                        self.connection_worker_map.insert(token, id);
+                    },
+                    Ok(InfoMessage::DeleteConnection(token, mut connection)) => {
+                        self.connection_worker_map.remove(&token);
+                        // TODO: remove unwrap
+                        self.poll.registry().deregister(&mut connection).unwrap();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        break;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        error!("The mpsc channel disconnected.");
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn start(&mut self) -> ! {
+        // TODO: remove magic number
+        let mut events = Events::with_capacity(8192);
+        loop {
+            // TODO: remove below magic number
+            self.poll.poll(&mut events, Some(Duration::from_micros(1))).unwrap();
+            // debug!("Got some events for TCP listener, processing one by one.");
+            for event in &events {
+                self.process_event(event);
+            }
+            self.process_job_worker_info();
         }
     }
 
@@ -344,7 +524,7 @@ impl Drop for TcpThreadPool {
     
             for (_, job_manager) in &self.job_list {
                 for _ in 0..job_manager.assigned_workers {
-                    job_manager.sender.send(WorkerMessage::Shutdown).unwrap();
+                    job_manager.worker_message_sender.send(WorkerMessage::Shutdown).unwrap();
                 }
             }
     
